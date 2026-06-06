@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0".parse()?);
-    headers.insert(ACCEPT, "application/json, text/html, */*".parse()?);
+    headers.insert(ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".parse()?);
     headers.insert(ACCEPT_LANGUAGE, "en-US,en;q=0.5".parse()?);
 
     let client = reqwest::Client::builder()
@@ -31,20 +31,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()?;
         
-    println!("Searching GitHub, Flathub, and SearXNG (Web) concurrently for '{}'...", search_query);
+    println!("Searching GitHub, System Flathub, and Web (Yahoo) concurrently for '{}'...", search_query);
 
+    // 1. GitHub API
     let gh_url = format!("https://api.github.com/search/repositories?q={}", search_query);
-    let flathub_url = format!("https://flathub.org/api/v2/search/{}", search_query);
-    let searx_url = format!("https://searx.be/search?q={}+official+linux+download&format=json", search_query);
-
     let gh_request = client.get(&gh_url).send();
-    let flathub_request = client.get(&flathub_url).send();
-    let web_request = client.get(&searx_url).send();
 
-    let (gh_res, flathub_res, web_res) = tokio::join!(gh_request, flathub_request, web_request);
+    // 2. Web (Yahoo Search - lenient on bot blocking)
+    let web_url = format!("https://search.yahoo.com/search?p={}+official+linux+download", search_query.replace(' ', "+"));
+    let web_request = client.get(&web_url).send();
+
+    // 3. System Flathub (Using native CLI instead of flaky APIs)
+    let sq_clone = search_query.clone();
+    let flatpak_task = tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new("flatpak").args(["search", &sq_clone]).output().ok()?;
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    });
+
+    let (gh_res, web_res, flatpak_res) = tokio::join!(gh_request, web_request, flatpak_task);
 
     let mut all_matches: Vec<AppMatch> = Vec::new();
 
+    // Parse GitHub
     if let Ok(resp) = gh_res {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
             if let Some(items) = json["items"].as_array() {
@@ -60,39 +68,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Ok(resp) = flathub_res {
-        if let Ok(json) = resp.json::<serde_json::Value>().await {
-            if let Some(hits) = json["hits"].as_array() {
-                for hit in hits.iter().take(3) {
-                    let id = hit["id"].as_str().unwrap_or("").to_string();
-                    all_matches.push(AppMatch {
-                        name: id.clone(),
-                        url: id,
-                        platform: "Flathub".to_string(),
-                    });
-                }
+    // Parse Local Flathub Command Output
+    if let Ok(Some(stdout)) = flatpak_res {
+        let mut count = 0;
+        for line in stdout.lines().skip(1) { // Skip header row
+            if count >= 3 { break; }
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() >= 3 {
+                let id = cols[2].trim().to_string();
+                all_matches.push(AppMatch {
+                    name: id.clone(),
+                    url: id,
+                    platform: "Flathub".to_string(),
+                });
+                count += 1;
             }
         }
     }
 
+    // Parse Web (Yahoo HTML Redirects)
     if let Ok(resp) = web_res {
-        if let Ok(json) = resp.json::<serde_json::Value>().await {
-            if let Some(results) = json["results"].as_array() {
-                let mut count = 0;
-                for result in results {
-                    if count >= 4 { break; }
-                    if let (Some(url), Some(title)) = (result["url"].as_str(), result["title"].as_str()) {
-                        if !url.contains("github.com") && !url.contains("flathub.org") && !url.contains("youtube.com") {
-                            let simple_name = url.replace("https://", "").replace("www.", "");
-                            let short_name = simple_name.split('/').next().unwrap_or(&simple_name);
-                            let clean_title = if title.len() > 30 { format!("{}...", &title[..27]) } else { title.to_string() };
+        if let Ok(html) = resp.text().await {
+            let mut count = 0;
+            let mut seen_domains = Vec::new();
+
+            // Yahoo wraps real URLs inside an RU= parameter
+            for token in html.split("RU=") {
+                if count >= 3 { break; }
+                if let Some(encoded_url) = token.split("/RK=").next() {
+                    if let Ok(decoded) = urlencoding::decode(encoded_url) {
+                        let final_url = decoded.to_string();
+                        if final_url.starts_with("http") 
+                            && !final_url.contains("yahoo.com") 
+                            && !final_url.contains("github.com") 
+                            && !final_url.contains("flathub.org") 
+                            && !final_url.contains("youtube.com") 
+                        {
+                            let simple_name = final_url.replace("https://", "").replace("http://", "").replace("www.", "");
+                            let domain = simple_name.split('/').next().unwrap_or(&simple_name).to_string();
                             
-                            all_matches.push(AppMatch {
-                                name: format!("{} ({})", short_name, clean_title),
-                                url: url.to_string(),
-                                platform: "Web".to_string(),
-                            });
-                            count += 1;
+                            if !seen_domains.contains(&domain) {
+                                seen_domains.push(domain.clone());
+                                all_matches.push(AppMatch {
+                                    name: format!("{} (Web)", domain),
+                                    url: final_url,
+                                    platform: "Web".to_string(),
+                                });
+                                count += 1;
+                            }
                         }
                     }
                 }
@@ -130,7 +153,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let download_url = asset["browser_download_url"].as_str().unwrap_or("");
                         let name_lower = name.to_lowercase();
                         
-                        // Strict architecture filtering to avoid architecture mismatch errors
                         if name_lower.contains("arm64") || name_lower.contains("aarch64") || name_lower.contains("armv7") {
                             continue;
                         }
@@ -173,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if found_links.is_empty() {
                     println!("❌ No direct binaries (.rpm, .AppImage, .tar.gz) exposed inside this page's root HTML.");
+                    println!("💡 Tip: Try selecting the [Flathub] option if available.");
                     return Ok(());
                 }
 
@@ -241,14 +264,12 @@ async fn execute_download_and_install(_client: &reqwest::Client, name: &str, url
         }
     } else if name.ends_with(".tar.gz") {
         let opt_dir = format!("{}/.local/opt/{}", home, app_short_name);
-        // Wipe old failed extractions to keep directory pristine
         let _ = std::fs::remove_dir_all(&opt_dir);
         std::fs::create_dir_all(&opt_dir)?;
         
         std::process::Command::new("tar").args(["-xzf", name, "-C", &opt_dir]).status()?;
         std::fs::remove_file(name)?;
 
-        // Exclude internal configuration, text, and shortcut metadata files from target matching
         let find_cmd = format!(
             "find {} -type f -executable ! -name '*.desktop' ! -name '*.txt' ! -name '*.sh' | grep -iE 'bin/|/{}' | head -n 1", 
             opt_dir, app_short_name
