@@ -21,10 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args[1].clone()
     };
 
-    // 1. Create realistic browser headers to prevent DuckDuckGo from blocking us
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0".parse()?);
-    headers.insert(ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8".parse()?);
+    headers.insert(ACCEPT, "application/json, text/html, */*".parse()?);
     headers.insert(ACCEPT_LANGUAGE, "en-US,en;q=0.5".parse()?);
 
     let client = reqwest::Client::builder()
@@ -32,22 +31,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()?;
         
-    println!("Searching GitHub, Flathub, and Web concurrently for '{}'...", search_query);
+    println!("Searching GitHub, Flathub, and SearXNG (Web) concurrently for '{}'...", search_query);
 
     let gh_url = format!("https://api.github.com/search/repositories?q={}", search_query);
     let flathub_url = format!("https://flathub.org/api/v2/search/{}", search_query);
-    // Modified query to strictly target official linux download pages
-    let ddg_url = format!("https://html.duckduckgo.com/html/?q={} +linux+official+download", search_query);
+    let searx_url = format!("https://searx.be/search?q={}+official+linux+download&format=json", search_query);
 
     let gh_request = client.get(&gh_url).send();
     let flathub_request = client.get(&flathub_url).send();
-    let ddg_request = client.get(&ddg_url).send();
+    let web_request = client.get(&searx_url).send();
 
-    let (gh_res, flathub_res, ddg_res) = tokio::join!(gh_request, flathub_request, ddg_request);
+    let (gh_res, flathub_res, web_res) = tokio::join!(gh_request, flathub_request, web_request);
 
     let mut all_matches: Vec<AppMatch> = Vec::new();
 
-    // Parse GitHub
     if let Ok(resp) = gh_res {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
             if let Some(items) = json["items"].as_array() {
@@ -63,7 +60,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Parse Flathub
     if let Ok(resp) = flathub_res {
         if let Ok(json) = resp.json::<serde_json::Value>().await {
             if let Some(hits) = json["hits"].as_array() {
@@ -79,27 +75,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Parse Web (DuckDuckGo HTML)
-    if let Ok(resp) = ddg_res {
-        if let Ok(html) = resp.text().await {
-            let mut count = 0;
-            for part in html.split("uddg=") {
-                if count >= 3 { break; } // Increase to top 3 web results
-                if let Some(raw_url) = part.split('&').next() {
-                    if let Ok(decoded) = urlencoding::decode(raw_url) {
-                        if decoded.starts_with("https://") 
-                           && !decoded.contains("duckduckgo.com") 
-                           && !decoded.contains("github.com") 
-                           && !decoded.contains("flathub.org") 
-                        {
-                            let simple_name = decoded
-                                .replace("https://", "")
-                                .replace("www.", "");
+    if let Ok(resp) = web_res {
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+            if let Some(results) = json["results"].as_array() {
+                let mut count = 0;
+                for result in results {
+                    if count >= 4 { break; }
+                    if let (Some(url), Some(title)) = (result["url"].as_str(), result["title"].as_str()) {
+                        if !url.contains("github.com") && !url.contains("flathub.org") && !url.contains("youtube.com") {
+                            let simple_name = url.replace("https://", "").replace("www.", "");
                             let short_name = simple_name.split('/').next().unwrap_or(&simple_name);
+                            let clean_title = if title.len() > 30 { format!("{}...", &title[..27]) } else { title.to_string() };
                             
                             all_matches.push(AppMatch {
-                                name: format!("{} ({})", short_name, simple_name),
-                                url: decoded.to_string(),
+                                name: format!("{} ({})", short_name, clean_title),
+                                url: url.to_string(),
                                 platform: "Web".to_string(),
                             });
                             count += 1;
@@ -138,6 +128,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for asset in assets {
                         let name = asset["name"].as_str().unwrap_or("");
                         let download_url = asset["browser_download_url"].as_str().unwrap_or("");
+                        let name_lower = name.to_lowercase();
+                        
+                        // Strict architecture filtering to avoid architecture mismatch errors
+                        if name_lower.contains("arm64") || name_lower.contains("aarch64") || name_lower.contains("armv7") {
+                            continue;
+                        }
+
                         if name.ends_with(".AppImage") || name.ends_with(".rpm") || name.ends_with(".tar.gz") {
                             valid_assets.push((name.to_string(), download_url.to_string()));
                         }
@@ -156,6 +153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut found_links = Vec::new();
                 for token in page_html.split("href=\"") {
                     if let Some(link) = token.split('"').next() {
+                        let link_lower = link.to_lowercase();
+                        if link_lower.contains("arm64") || link_lower.contains("aarch64") {
+                            continue;
+                        }
                         if link.ends_with(".rpm") || link.ends_with(".AppImage") || link.ends_with(".tar.gz") {
                             let absolute_link = if link.starts_with("http") {
                                 link.to_string()
@@ -172,7 +173,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if found_links.is_empty() {
                     println!("❌ No direct binaries (.rpm, .AppImage, .tar.gz) exposed inside this page's root HTML.");
-                    println!("💡 Tip: Try running the search again and selecting the [Flathub] option instead.");
                     return Ok(());
                 }
 
@@ -194,7 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn handle_github_install(client: &reqwest::Client, valid_assets: Vec<(String, String)>, repo_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     if valid_assets.is_empty() {
-        println!("❌ No compatible binary formats (.AppImage, .rpm, .tar.gz) found in this repo's releases.");
+        println!("❌ No compatible x86_64 binary formats (.AppImage, .rpm, .tar.gz) found.");
         return Ok(());
     }
     let asset_names: Vec<String> = valid_assets.iter().map(|(name, _)| name.clone()).collect();
@@ -212,7 +212,6 @@ async fn handle_github_install(client: &reqwest::Client, valid_assets: Vec<(Stri
 async fn execute_download_and_install(_client: &reqwest::Client, name: &str, url: &str, app_short_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("Downloading {} via axel (8 connections)...", name);
     
-    // Changed connections from 4 to 8
     let status = std::process::Command::new("axel").args(["-n", "8", "-a", url, "-o", name]).status();
     if !status.unwrap_or_default().success() {
         println!("❌ Download failed.");
@@ -242,11 +241,18 @@ async fn execute_download_and_install(_client: &reqwest::Client, name: &str, url
         }
     } else if name.ends_with(".tar.gz") {
         let opt_dir = format!("{}/.local/opt/{}", home, app_short_name);
+        // Wipe old failed extractions to keep directory pristine
+        let _ = std::fs::remove_dir_all(&opt_dir);
         std::fs::create_dir_all(&opt_dir)?;
+        
         std::process::Command::new("tar").args(["-xzf", name, "-C", &opt_dir]).status()?;
         std::fs::remove_file(name)?;
 
-        let find_cmd = format!("find {} -type f -executable | grep -iE 'bin/|/{}' | head -n 1", opt_dir, app_short_name);
+        // Exclude internal configuration, text, and shortcut metadata files from target matching
+        let find_cmd = format!(
+            "find {} -type f -executable ! -name '*.desktop' ! -name '*.txt' ! -name '*.sh' | grep -iE 'bin/|/{}' | head -n 1", 
+            opt_dir, app_short_name
+        );
         let output = std::process::Command::new("sh").args(["-c", &find_cmd]).output()?;
         let bin_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
