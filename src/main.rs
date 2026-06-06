@@ -1,39 +1,266 @@
-use reqwest::header::USER_AGENT;
+use dialoguer::{theme::ColorfulTheme, Select};
+use reqwest::header::{HeaderMap, USER_AGENT, ACCEPT, ACCEPT_LANGUAGE};
 use std::env;
-use std::fs::File;
-use std::io::copy;
 
-fn main() -> Result<(), Box> {
-    let args: Vec = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: sit ");
-        std::process::exit(1);
-    }
-    let repo = &args[1];
-    let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
+#[derive(Clone)]
+struct AppMatch {
+    name: String,
+    platform: String,
+    url: String,
+}
 
-    let client = reqwest::blocking::Client::new();
-    let response: serde_json::Value = client
-        .get(&url)
-        .header(USER_AGENT, "sit-cli")
-        .send()?
-        .json()?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+    let search_query = if args.len() < 2 {
+        println!("Enter application keyword:");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        input.trim().to_string()
+    } else {
+        args[1].clone()
+    };
 
-    let assets = response["assets"].as_array().expect("No assets found or rate limited");
-    println!("Found {} assets.", assets.len());
+    // 1. Create realistic browser headers to prevent DuckDuckGo from blocking us
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0".parse()?);
+    headers.insert(ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8".parse()?);
+    headers.insert(ACCEPT_LANGUAGE, "en-US,en;q=0.5".parse()?);
 
-    for asset in assets {
-        let name = asset["name"].as_str().unwrap_or("");
-        let download_url = asset["browser_download_url"].as_str().unwrap_or("");
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()?;
+        
+    println!("Searching GitHub, Flathub, and Web concurrently for '{}'...", search_query);
 
-        if name.ends_with(".AppImage") || name.ends_with(".rpm") || name.ends_with(".tar.gz") {
-            println!("Downloading: {}", name);
-            let mut resp = client.get(download_url).header(USER_AGENT, "sit-cli").send()?;
-            let mut out = File::create(name)?;
-            copy(&mut resp, &mut out)?;
-            println!("Download complete.");
-            break;
+    let gh_url = format!("https://api.github.com/search/repositories?q={}", search_query);
+    let flathub_url = format!("https://flathub.org/api/v2/search/{}", search_query);
+    // Modified query to strictly target official linux download pages
+    let ddg_url = format!("https://html.duckduckgo.com/html/?q={} +linux+official+download", search_query);
+
+    let gh_request = client.get(&gh_url).send();
+    let flathub_request = client.get(&flathub_url).send();
+    let ddg_request = client.get(&ddg_url).send();
+
+    let (gh_res, flathub_res, ddg_res) = tokio::join!(gh_request, flathub_request, ddg_request);
+
+    let mut all_matches: Vec<AppMatch> = Vec::new();
+
+    // Parse GitHub
+    if let Ok(resp) = gh_res {
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+            if let Some(items) = json["items"].as_array() {
+                for item in items.iter().take(3) {
+                    let name = item["full_name"].as_str().unwrap_or("").to_string();
+                    all_matches.push(AppMatch {
+                        url: format!("https://api.github.com/repos/{}/releases/latest", name),
+                        name,
+                        platform: "GitHub".to_string(),
+                    });
+                }
+            }
         }
     }
+
+    // Parse Flathub
+    if let Ok(resp) = flathub_res {
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+            if let Some(hits) = json["hits"].as_array() {
+                for hit in hits.iter().take(3) {
+                    let id = hit["id"].as_str().unwrap_or("").to_string();
+                    all_matches.push(AppMatch {
+                        name: id.clone(),
+                        url: id,
+                        platform: "Flathub".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Parse Web (DuckDuckGo HTML)
+    if let Ok(resp) = ddg_res {
+        if let Ok(html) = resp.text().await {
+            let mut count = 0;
+            for part in html.split("uddg=") {
+                if count >= 3 { break; } // Increase to top 3 web results
+                if let Some(raw_url) = part.split('&').next() {
+                    if let Ok(decoded) = urlencoding::decode(raw_url) {
+                        if decoded.starts_with("https://") 
+                           && !decoded.contains("duckduckgo.com") 
+                           && !decoded.contains("github.com") 
+                           && !decoded.contains("flathub.org") 
+                        {
+                            let simple_name = decoded
+                                .replace("https://", "")
+                                .replace("www.", "");
+                            let short_name = simple_name.split('/').next().unwrap_or(&simple_name);
+                            
+                            all_matches.push(AppMatch {
+                                name: format!("{} ({})", short_name, simple_name),
+                                url: decoded.to_string(),
+                                platform: "Web".to_string(),
+                            });
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if all_matches.is_empty() {
+        println!("❌ No sources returned from any platform.");
+        return Ok(());
+    }
+
+    let display_options: Vec<String> = all_matches
+        .iter()
+        .map(|app| format!("[{}] {}", app.platform, app.name))
+        .collect();
+
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select source to install from")
+        .items(&display_options)
+        .default(0)
+        .interact()?;
+
+    let chosen = &all_matches[selection];
+    println!("\nYou selected {} via {}.", chosen.name, chosen.platform);
+
+    if chosen.platform == "GitHub" {
+        println!("Fetching latest GitHub binary release...");
+        if let Ok(resp) = client.get(&chosen.url).send().await {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                if let Some(assets) = json["assets"].as_array() {
+                    let mut valid_assets = Vec::new();
+                    for asset in assets {
+                        let name = asset["name"].as_str().unwrap_or("");
+                        let download_url = asset["browser_download_url"].as_str().unwrap_or("");
+                        if name.ends_with(".AppImage") || name.ends_with(".rpm") || name.ends_with(".tar.gz") {
+                            valid_assets.push((name.to_string(), download_url.to_string()));
+                        }
+                    }
+                    handle_github_install(&client, valid_assets, &chosen.name).await?;
+                }
+            }
+        }
+    } else if chosen.platform == "Flathub" {
+        println!("Running system Flatpak installation...");
+        std::process::Command::new("flatpak").args(["install", "flathub", &chosen.url, "-y"]).status()?;
+    } else if chosen.platform == "Web" {
+        println!("Scanning website landing page HTML for direct download binaries...");
+        if let Ok(resp) = client.get(&chosen.url).send().await {
+            if let Ok(page_html) = resp.text().await {
+                let mut found_links = Vec::new();
+                for token in page_html.split("href=\"") {
+                    if let Some(link) = token.split('"').next() {
+                        if link.ends_with(".rpm") || link.ends_with(".AppImage") || link.ends_with(".tar.gz") {
+                            let absolute_link = if link.starts_with("http") {
+                                link.to_string()
+                            } else {
+                                format!("{}{}", chosen.url.trim_end_matches('/'), link)
+                            };
+                            let file_name = absolute_link.split('/').last().unwrap_or("downloaded_asset").to_string();
+                            if !found_links.iter().any(|(n, _)| n == &file_name) {
+                                found_links.push((file_name, absolute_link));
+                            }
+                        }
+                    }
+                }
+
+                if found_links.is_empty() {
+                    println!("❌ No direct binaries (.rpm, .AppImage, .tar.gz) exposed inside this page's root HTML.");
+                    println!("💡 Tip: Try running the search again and selecting the [Flathub] option instead.");
+                    return Ok(());
+                }
+
+                let asset_names: Vec<String> = found_links.iter().map(|(name, _)| name.clone()).collect();
+                let asset_selection = Select::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Select binary found on website")
+                    .items(&asset_names)
+                    .default(0)
+                    .interact()?;
+
+                let (chosen_name, chosen_url) = &found_links[asset_selection];
+                execute_download_and_install(&client, chosen_name, chosen_url, "web-app").await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_github_install(client: &reqwest::Client, valid_assets: Vec<(String, String)>, repo_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if valid_assets.is_empty() {
+        println!("❌ No compatible binary formats (.AppImage, .rpm, .tar.gz) found in this repo's releases.");
+        return Ok(());
+    }
+    let asset_names: Vec<String> = valid_assets.iter().map(|(name, _)| name.clone()).collect();
+    let asset_selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select format to download")
+        .items(&asset_names)
+        .default(0)
+        .interact()?;
+
+    let (chosen_name, chosen_url) = &valid_assets[asset_selection];
+    let app_short_name = repo_name.split('/').last().unwrap_or("app");
+    execute_download_and_install(client, chosen_name, chosen_url, app_short_name).await
+}
+
+async fn execute_download_and_install(_client: &reqwest::Client, name: &str, url: &str, app_short_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Downloading {} via axel (8 connections)...", name);
+    
+    // Changed connections from 4 to 8
+    let status = std::process::Command::new("axel").args(["-n", "8", "-a", url, "-o", name]).status();
+    if !status.unwrap_or_default().success() {
+        println!("❌ Download failed.");
+        return Ok(());
+    }
+
+    let home = env::var("HOME").unwrap_or_else(|_| String::from("~"));
+    let local_bin = format!("{}/.local/bin", home);
+    let apps_dir = format!("{}/.local/share/applications", home);
+    std::fs::create_dir_all(&local_bin)?;
+    std::fs::create_dir_all(&apps_dir)?;
+
+    if name.ends_with(".AppImage") {
+        std::process::Command::new("chmod").args(["+x", name]).status()?;
+        let target = format!("{}/{}", local_bin, app_short_name);
+        std::fs::rename(name, &target)?;
+        
+        let desktop = format!("[Desktop Entry]\nName={}\nExec={}\nType=Application\nTerminal=false\n", app_short_name, target);
+        std::fs::write(format!("{}/{}.desktop", apps_dir, app_short_name), desktop)?;
+        println!("✅ Installed to {}. Added to App Launcher.", target);
+
+    } else if name.ends_with(".rpm") {
+        println!("Sudo password required for DNF installation:");
+        if std::process::Command::new("sudo").args(["dnf", "install", "-y", name]).status()?.success() {
+            std::fs::remove_file(name)?;
+            println!("✅ RPM installed. Source deleted.");
+        }
+    } else if name.ends_with(".tar.gz") {
+        let opt_dir = format!("{}/.local/opt/{}", home, app_short_name);
+        std::fs::create_dir_all(&opt_dir)?;
+        std::process::Command::new("tar").args(["-xzf", name, "-C", &opt_dir]).status()?;
+        std::fs::remove_file(name)?;
+
+        let find_cmd = format!("find {} -type f -executable | grep -iE 'bin/|/{}' | head -n 1", opt_dir, app_short_name);
+        let output = std::process::Command::new("sh").args(["-c", &find_cmd]).output()?;
+        let bin_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        if !bin_path.is_empty() {
+            let symlink = format!("{}/{}", local_bin, app_short_name);
+            std::process::Command::new("ln").args(["-sf", &bin_path, &symlink]).status()?;
+            
+            let desktop = format!("[Desktop Entry]\nName={}\nExec={}\nType=Application\nTerminal=false\n", app_short_name, bin_path);
+            std::fs::write(format!("{}/{}.desktop", apps_dir, app_short_name), desktop)?;
+            println!("✅ Extracted to {}. Linked to path and App Launcher.", opt_dir);
+        } else {
+            println!("✅ Extracted to {}. Could not auto-link binary.", opt_dir);
+        }
+    }
+    std::process::Command::new("update-desktop-database").args([&apps_dir]).status().ok();
     Ok(())
 }
