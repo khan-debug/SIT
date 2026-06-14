@@ -10,12 +10,6 @@ Run the following command to install SIT directly on your system:
 curl -sSL https://raw.githubusercontent.com/khan-debug/SIT/main/install.sh | bash
 ```
 
-*Note: If you haven't pushed this to a public repository yet, you can run the local script:*
-
-```bash
-chmod +x install.sh && ./install.sh
-```
-
 ## Features
 
 - **Unified Search:** Searches for packages across system repositories and Flathub.
