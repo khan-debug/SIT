@@ -1,11 +1,38 @@
 [package]
+name    = "sit"
+version = "0.3.0"
+edition = "2021"
+
+[[bin]]
 name = "sit"
-version = "0.1.0"
-edition = "2024"
+path = "src/main.rs"
 
 [dependencies]
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
-serde_json = "1.0"
-dialoguer = "0.11"
-tokio = { version = "1.0", features = ["full"] }
-urlencoding = "2.1"
+# Async runtime
+tokio        = { version = "1",  features = ["full"] }
+
+# HTTP client
+reqwest      = { version = "0.12", features = ["json"] }
+
+# JSON parsing (GitHub API)
+serde_json   = "1"
+
+# HTML parsing — replaces the fragile split("href=\"") approach
+scraper      = "0.21"
+
+# URL encoding / decoding
+urlencoding  = "2"
+
+# URL parsing (scheme, host extraction, relative → absolute resolution)
+url          = "2"
+
+# Regex (GitHub Pivot detection, asset URL extraction from scripts)
+regex        = "1"
+
+# Interactive TUI selector
+dialoguer    = { version = "0.11", features = ["completion"] }
+
+[profile.release]
+opt-level = 3
+lto       = true
+strip     = true
