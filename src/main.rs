@@ -345,7 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Real URL is in data-href or the href itself (not redirect-wrapped like Yahoo)
             let link_sel = Selector::parse("a.result__a, a.result__url").unwrap();
             for el in document.select(&link_sel) {
-                if count >= 3 { break; }
+                if count >= 5 { break; }  // Show more web results
 
                 // Try data-href first (DDG sometimes puts the real URL there)
                 let href = el.value().attr("data-href")
@@ -388,8 +388,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if domain.is_empty() || seen_domains.contains(&domain) { continue; }
                 seen_domains.push(domain.clone());
 
+                // For now, just use the domain as description
+                // (Title extraction would require more complex HTML parsing)
+                let description = domain.clone();
+
+                // Clean up the description
+                let clean_description = description
+                    .replace("Download", "")
+                    .replace("download", "")
+                    .replace("|", " - ")
+                    .trim()
+                    .to_string();
+
                 all_matches.push(AppMatch {
-                    name:     format!("{} (Web)", domain),
+                    name:     format!("🌐 {} ({})", clean_description, domain),
                     url:      final_url,
                     platform: "Web".to_string(),
                 });
@@ -424,6 +436,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             handle_github(&client, &chosen.url, &chosen.name, &distro).await?;
         }
         "Flathub" => {
+            println!("📦 Preparing to install Flathub package: {}", chosen.name);
+            if !confirm_sudo_operation("install this Flatpak package")? {
+                println!("🚫 Installation cancelled by user.");
+                return Ok(());
+            }
             println!("📦 Running flatpak install...");
             std::process::Command::new("flatpak")
                 .args(["install", "flathub", &chosen.url, "-y"])
@@ -502,16 +519,55 @@ async fn handle_direct_url(
         return Ok(());
     }
 
-    // Step 4: Present found links
+    // Step 4: Auto-select best package or present choices
     sort_assets(&mut links, distro);
-    let names: Vec<String> = links.iter().map(|(n, _)| n.clone()).collect();
-    let sel = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select binary to install")
-        .items(&names)
-        .default(0)
-        .interact()?;
 
-    let (fname, furl) = &links[sel];
+    let (fname, furl) = if links.is_empty() {
+        println!("❌ No installable packages found.");
+        return Ok(());
+    } else if links.len() == 1 {
+        // Only one option - auto-select it
+        println!("🎯 Found single package: {}", links[0].0);
+        (&links[0].0, &links[0].1)
+    } else {
+        // Multiple options - try to auto-select the best one
+        let best_index = auto_select_best_package(&links, distro);
+        let best_package = &links[best_index].0;
+
+        println!("🤖 Auto-selected best package: {}", best_package);
+        println!("   (You can change this selection if needed)");
+
+        // Show all options with the best one pre-selected
+        let names: Vec<String> = links.iter().enumerate().map(|(i, (n, _))| {
+            let n_lower = n.to_lowercase();
+            let mut display_name = String::new();
+
+            if i == best_index {
+                display_name.push_str("✓ ");
+            } else {
+                display_name.push_str("  ");
+            }
+
+            if n_lower.ends_with(".appimage") {
+                display_name.push_str(&format!("{} 🐧", n));
+            } else if n_lower.ends_with(".deb") {
+                display_name.push_str(&format!("{} 📦", n));
+            } else if n_lower.ends_with(".rpm") {
+                display_name.push_str(&format!("{} 📦", n));
+            } else {
+                display_name.push_str(&format!("{} 📦", n));
+            }
+
+            display_name
+        }).collect();
+
+        let sel = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select binary to install")
+            .items(&names)
+            .default(best_index)
+            .interact()?;
+        (&links[sel].0, &links[sel].1)
+    };
     let app_name = fname
         .split('_').next()
         .and_then(|s| s.split('-').next())
@@ -681,6 +737,17 @@ fn install_deb(
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("🔐 Sudo password required for .deb installation:");
 
+    // Show package details and ask for confirmation
+    if let Ok(metadata) = std::fs::metadata(name) {
+        println!("   Package: {}", name.split('/').last().unwrap_or(name));
+        println!("   Size: {} bytes", metadata.len());
+    }
+
+    if !confirm_sudo_operation("install this .deb package")? {
+        println!("🚫 Installation cancelled by user.");
+        return Ok(());
+    }
+
     // `name` is already an absolute path (e.g. /tmp/sit-downloads/foo.deb).
     // apt needs either an absolute path or a "./"-prefixed relative path to
     // recognise it as a local file rather than a repo package name.
@@ -714,7 +781,7 @@ fn install_deb(
         std::fs::remove_file(name).ok();
         println!("✅ .deb installed successfully. Source file removed.");
     } else {
-        println!("❌ .deb installation failed. File kept at ./{}", name);
+        println!("❌ .deb installation failed. File kept at {}", name);
     }
     Ok(())
 }
@@ -724,6 +791,17 @@ fn install_rpm(
     distro: &Distro,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("🔐 Sudo password required for .rpm installation:");
+
+    // Show package details and ask for confirmation
+    if let Ok(metadata) = std::fs::metadata(name) {
+        println!("   Package: {}", name.split('/').last().unwrap_or(name));
+        println!("   Size: {} bytes", metadata.len());
+    }
+
+    if !confirm_sudo_operation("install this .rpm package")? {
+        println!("🚫 Installation cancelled by user.");
+        return Ok(());
+    }
 
     let success = match distro {
         Distro::Fedora => {
@@ -747,7 +825,7 @@ fn install_rpm(
         std::fs::remove_file(name).ok();
         println!("✅ .rpm installed successfully. Source file removed.");
     } else {
-        println!("❌ .rpm installation failed. File kept at ./{}", name);
+        println!("❌ .rpm installation failed. File kept at {}", name);
     }
     Ok(())
 }
@@ -760,7 +838,11 @@ fn install_tarball(
     apps_dir: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let opt_dir = format!("{}/.local/opt/{}", home, app_short_name);
-    let _ = std::fs::remove_dir_all(&opt_dir);
+
+    // Clean up existing installation if it exists
+    if std::path::Path::new(&opt_dir).exists() {
+        std::fs::remove_dir_all(&opt_dir)?;
+    }
     std::fs::create_dir_all(&opt_dir)?;
 
     // Pick the right tar flag for the compression type
@@ -768,40 +850,39 @@ fn install_tarball(
         else if name.ends_with(".tar.xz")  { "-xJf" }
         else { "-xjf" }; // .tar.bz2
 
-    std::process::Command::new("tar")
+    println!("📦 Extracting {} to {}", name, opt_dir);
+    let tar_status = std::process::Command::new("tar")
         .args([compress_flag, name, "-C", &opt_dir, "--strip-components=1"])
         .status()?;
-    std::fs::remove_file(name).ok();
 
-    // Find the primary executable: prefer a file matching the app name in a bin/ dir,
-    // then any executable that isn't a library/script
-    let find_cmd = format!(
-        r#"find {opt} -type f \( -executable -o -perm /111 \) \
-            ! -name '*.so' ! -name '*.so.*' ! -name '*.desktop' \
-            ! -name '*.txt'  ! -name '*.md'  ! -name '*.sh' \
-            ! -name '*.py'   ! -name '*.rb'  ! -name '*.pl' \
-            | sort | grep -iE '(bin/|/{name})' \
-            | head -n 1 || \
-          find {opt} -maxdepth 3 -type f \( -executable -o -perm /111 \) \
-            ! -name '*.so' ! -name '*.so.*' ! -name '*.desktop' \
-            ! -name '*.txt' ! -name '*.md' \
-            | head -n 1"#,
-        opt = opt_dir,
-        name = app_short_name,
-    );
+    if !tar_status.success() {
+        return Err(format!("Failed to extract tarball: {}", name).into());
+    }
 
-    let out = std::process::Command::new("sh").args(["-c", &find_cmd]).output()?;
-    let bin_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Remove the downloaded file after successful extraction
+    std::fs::remove_file(name)?;
 
-    if !bin_path.is_empty() {
+    // Find the primary executable using a more robust Rust-based approach
+    let bin_path = find_executable_in_directory(&opt_dir, app_short_name);
+
+    if let Some(ref bin_path) = bin_path {
         let symlink = format!("{}/{}", local_bin, app_short_name);
-        // Remove stale symlink before creating a new one
-        std::fs::remove_file(&symlink).ok();
-        std::process::Command::new("ln")
-            .args(["-sf", &bin_path, &symlink])
-            .status()?;
 
-        write_desktop_file(apps_dir, app_short_name, &bin_path)?;
+        // Remove stale symlink before creating a new one
+        if std::path::Path::new(&symlink).exists() {
+            std::fs::remove_file(&symlink)?;
+        }
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(bin_path, &symlink)?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::os::windows::fs::symlink_file(bin_path, symlink)?;
+        }
+
+        write_desktop_file(apps_dir, app_short_name, bin_path)?;
         println!("✅ Extracted to {}.", opt_dir);
         println!("   Symlink: {} → {}", symlink, bin_path);
         println!("   Launcher shortcut created.");
@@ -811,6 +892,67 @@ fn install_tarball(
         println!("   Browse {} and run the binary manually.", opt_dir);
     }
     Ok(())
+}
+
+/// Find an executable file in the extracted directory
+/// Returns the path to the executable if found, None otherwise
+fn find_executable_in_directory(dir: &str, app_name: &str) -> Option<String> {
+    use std::fs;
+
+    let mut candidates = Vec::new();
+
+    // Recursive function to find executables
+    fn find_executables(path: &str, app_name: &str, candidates: &mut Vec<(i32, String)>) {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                let entry_path_str = entry_path.to_string_lossy().into_owned();
+
+                if entry_path.is_dir() {
+                    find_executables(&entry_path_str, app_name, candidates);
+                } else if entry_path.is_file() {
+                    // Check if file is executable
+                    if let Ok(metadata) = fs::metadata(&entry_path) {
+                        use std::os::unix::fs::PermissionsExt;
+                        if metadata.permissions().mode() & 0o111 != 0 {
+                            // Skip common non-binary files
+                            let file_name = entry_path.file_name().unwrap_or_default();
+                            let file_name_str = file_name.to_string_lossy();
+
+                            if !file_name_str.starts_with("lib") &&
+                               !file_name_str.ends_with(".so") &&
+                               !file_name_str.ends_with(".so.") &&
+                               !file_name_str.ends_with(".desktop") &&
+                               !file_name_str.ends_with(".txt") &&
+                               !file_name_str.ends_with(".md") &&
+                               !file_name_str.ends_with(".sh") &&
+                               !file_name_str.ends_with(".py") &&
+                               !file_name_str.ends_with(".rb") &&
+                               !file_name_str.ends_with(".pl") {
+
+                                // Prioritize files in bin/ directory or matching app name
+                                let mut score = 0;
+                                if entry_path_str.contains("/bin/") {
+                                    score += 2;
+                                }
+                                if entry_path_str.contains(&format!("/{}", app_name)) {
+                                    score += 1;
+                                }
+
+                                candidates.push((score, entry_path_str));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    find_executables(dir, app_name, &mut candidates);
+
+    // Sort by score (higher is better) and return the best candidate
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.into_iter().map(|(_, path)| path).next()
 }
 
 // ─── Desktop Entry Writer ─────────────────────────────────────────────────────
@@ -836,6 +978,58 @@ fn capitalise(s: &str) -> String {
         None => String::new(),
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
     }
+}
+
+/// Ask user for confirmation before performing sudo operations
+/// Returns true if user confirms, false if cancelled
+fn confirm_sudo_operation(action: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    use dialoguer::Confirm;
+
+    let confirmed = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!("Are you sure you want to {}?", action))
+        .default(true)
+        .interact()?;
+
+    Ok(confirmed)
+}
+
+/// Auto-select the best package based on common naming patterns
+/// Returns the index of the best package, or 0 if no clear winner
+fn auto_select_best_package(links: &[(String, String)], distro: &Distro) -> usize {
+    let mut scores: Vec<(usize, i32)> = links.iter().enumerate().map(|(i, (name, _))| {
+        let name_lower = name.to_lowercase();
+        let mut score = 0;
+
+        // Score based on distro preference
+        match distro {
+            Distro::Fedora => {
+                if name_lower.ends_with(".rpm") { score += 10; }
+            }
+            Distro::Ubuntu => {
+                if name_lower.ends_with(".deb") { score += 10; }
+            }
+            Distro::Unknown => {
+                if name_lower.ends_with(".appimage") { score += 10; }
+            }
+        }
+
+        // Score based on common patterns
+        if name_lower.contains("stable") { score += 5; }
+        if name_lower.contains("latest") { score += 3; }
+        if name_lower.contains("release") { score += 3; }
+        if name_lower.contains("x64") || name_lower.contains("x86_64") || name_lower.contains("amd64") { score += 2; }
+
+        // Penalize pre-release versions
+        if name_lower.contains("alpha") || name_lower.contains("beta") || name_lower.contains("rc") || name_lower.contains("dev") {
+            score -= 5;
+        }
+
+        (i, score)
+    }).collect();
+
+    // Sort by score and return the highest
+    scores.sort_by(|a, b| b.1.cmp(&a.1));
+    scores.first().map(|(i, _)| *i).unwrap_or(0)
 }
 
 // ─── HTTP Client Builder ──────────────────────────────────────────────────────
