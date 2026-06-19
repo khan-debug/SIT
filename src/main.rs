@@ -75,8 +75,6 @@ fn is_valid_asset(name: &str, distro: &Distro) -> bool {
         || n.contains(".dmg")
         || n.contains(".pkg")
         || n.contains("musl")           // musl-static builds rarely work on glibc distros
-        || n.contains("setup")
-        || n.contains("installer")
         || n.contains("i686")           // 32-bit
         || n.contains("i386")
         || n.ends_with(".sha256")
@@ -85,17 +83,32 @@ fn is_valid_asset(name: &str, distro: &Distro) -> bool {
         || n.ends_with(".asc")
         || n.ends_with(".json")
         || n.ends_with(".txt")
-        || n.ends_with(".zip")          // zip is almost never a Linux native pkg
         || n.ends_with(".blockmap")
     {
         return false;
     }
 
+    // Special case: Allow .zip files from common sources that package Linux binaries in zip
+    // (e.g., VS Code, JetBrains IDEs)
+    if n.ends_with(".zip") {
+        // Check if the filename suggests it's a Linux package
+        if n.contains("linux") || n.contains("x64") || n.contains("amd64") {
+            return true;
+        }
+        return false;
+    }
+
+    // Special case: Reject "setup" and "installer" only if they're not part of a valid package name
+    // (e.g., reject "setup.exe" but allow "vscode-setup.tar.gz")
+    if (n.contains("setup") || n.contains("installer")) && !n.contains("linux") && !n.contains("x64") && !n.contains("amd64") {
+        return false;
+    }
+
     // Require at least one accepted extension
     let accepted = match distro {
-        Distro::Fedora  => vec![".rpm", ".appimage", ".tar.gz", ".tar.xz", ".tar.bz2"],
-        Distro::Ubuntu  => vec![".deb", ".appimage", ".tar.gz", ".tar.xz", ".tar.bz2"],
-        Distro::Unknown => vec![".appimage", ".tar.gz", ".tar.xz", ".tar.bz2"],
+        Distro::Fedora  => vec![".rpm", ".appimage", ".tar.gz", ".tar.xz", ".tar.bz2", ".zip"],
+        Distro::Ubuntu  => vec![".deb", ".appimage", ".tar.gz", ".tar.xz", ".tar.bz2", ".zip"],
+        Distro::Unknown => vec![".appimage", ".tar.gz", ".tar.xz", ".tar.bz2", ".zip"],
     };
     accepted.iter().any(|ext| n.ends_with(ext))
 }
@@ -147,21 +160,13 @@ fn extract_github_repo(html: &str) -> Option<String> {
 
 /// Resolve a potentially-relative link to an absolute URL given the page base.
 fn resolve_url(base: &str, href: &str) -> Option<String> {
-    if href.starts_with("http://") || href.starts_with("https://") {
-        return Some(href.to_string());
-    }
-    if href.starts_with("//") {
-        return Some(format!("https:{}", href));
-    }
-    if href.starts_with('/') {
-        // absolute path — prepend scheme + host
-        let parsed = url::Url::parse(base).ok()?;
-        return Some(format!("{}://{}{}", parsed.scheme(), parsed.host_str()?, href));
-    }
-    // relative path
-    let parsed = url::Url::parse(base).ok()?;
-    let base_dir = parsed.as_str().rsplitn(2, '/').last()?;
-    Some(format!("{}/{}", base_dir, href))
+    let base_url = url::Url::parse(base).ok()?;
+    Some(base_url.join(href).ok()?.to_string())
+}
+
+/// Extract filename from a URL, stripping query params.
+fn extract_fname(url: &str) -> String {
+    url.rsplit('/').next().unwrap_or("").split('?').next().unwrap_or("").to_string()
 }
 
 /// Scrapes a page for installable binary links.
@@ -175,12 +180,11 @@ fn scrape_download_links(html: &str, page_url: &str, distro: &Distro) -> Vec<(St
         for el in document.select(&a_sel) {
             if let Some(href) = el.value().attr("href") {
                 if let Some(abs) = resolve_url(page_url, href) {
-                    let fname = abs.split('/').last().unwrap_or("").split('?').next().unwrap_or("").to_string();
-                    if is_valid_asset(&fname, distro) {
-                        if !links.iter().any(|(n, _)| n == &fname) {
+                    let fname = extract_fname(&abs);
+                    if is_valid_asset(&fname, distro)
+                        && !links.iter().any(|(n, _)| n == &fname) {
                             links.push((fname, abs));
                         }
-                    }
                 }
             }
         }
@@ -199,12 +203,11 @@ fn scrape_download_links(html: &str, page_url: &str, distro: &Distro) -> Vec<(St
             for el in document.select(&sel) {
                 if let Some(href) = el.value().attr(attr) {
                     if let Some(abs) = resolve_url(page_url, href) {
-                        let fname = abs.split('/').last().unwrap_or("").split('?').next().unwrap_or("").to_string();
-                        if is_valid_asset(&fname, distro) {
-                            if !links.iter().any(|(n, _)| n == &fname) {
+                        let fname = extract_fname(&abs);
+                        if is_valid_asset(&fname, distro)
+                            && !links.iter().any(|(n, _)| n == &fname) {
                                 links.push((fname, abs));
                             }
-                        }
                     }
                 }
             }
@@ -214,13 +217,66 @@ fn scrape_download_links(html: &str, page_url: &str, distro: &Distro) -> Vec<(St
     // 3. Regex scan raw HTML for anything that looks like a binary URL
     //    Catches URLs embedded in <script> blocks, onclick="...", window.location, etc.
     let url_re = Regex::new(
-        r#"https?://[^\s"'<>]+\.(?:AppImage|deb|rpm|tar\.gz|tar\.xz|tar\.bz2)"#
+        r#"https?://[^\s"'<>]+\.(?:AppImage|deb|rpm|tar\.gz|tar\.xz|tar\.bz2|zip)"#
     ).unwrap();
     for cap in url_re.captures_iter(html) {
         let abs = cap[0].to_string();
-        let fname = abs.split('/').last().unwrap_or("").split('?').next().unwrap_or("").to_string();
+        let fname = extract_fname(&abs);
         if is_valid_asset(&fname, distro) && !links.iter().any(|(n, _)| n == &fname) {
             links.push((fname, abs));
+        }
+    }
+
+    // 4. Download button attributes + class/ID selectors
+    let onclick_re = Regex::new(r#"https?://[^\s'"\)]+\.(?:AppImage|deb|rpm|tar\.gz|tar\.xz|tar\.bz2|zip)"#).unwrap();
+
+    let button_sels: &[&str] = &[
+        "[onclick]", "[data-url]", "[data-download-url]",
+        "[data-os]", "[data-href]", "[data-download]", "[data-src]",
+        "button[class*='download']", "a[class*='download']",
+        "button[id*='download']",  "a[id*='download']",
+    ];
+
+    for sel_str in button_sels {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            for el in document.select(&sel) {
+                // For data-os="linux" elements, look at href + data-download-url
+                if let Some(os_val) = el.value().attr("data-os") {
+                    if os_val.to_lowercase().contains("linux") {
+                        for attr in &["href", "data-download-url"] {
+                            if let Some(href) = el.value().attr(attr) {
+                                if let Some(abs) = resolve_url(page_url, href) {
+                                    let fname = extract_fname(&abs);
+                                    if is_valid_asset(&fname, distro) && !links.iter().any(|(n, _)| n == &fname) {
+                                        links.push((fname, abs));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Try all URL-bearing data attributes
+                for attr in &["data-href", "data-url", "data-download", "data-src", "data-download-url", "href"] {
+                    if let Some(val) = el.value().attr(attr) {
+                        if let Some(abs) = resolve_url(page_url, val) {
+                            let fname = extract_fname(&abs);
+                            if is_valid_asset(&fname, distro) && !links.iter().any(|(n, _)| n == &fname) {
+                                links.push((fname, abs));
+                            }
+                        }
+                    }
+                }
+                // Extract URL from onclick handlers
+                if let Some(val) = el.value().attr("onclick") {
+                    if let Some(cap) = onclick_re.captures(val) {
+                        let abs = cap[0].to_string();
+                        let fname = extract_fname(&abs);
+                        if is_valid_asset(&fname, distro) && !links.iter().any(|(n, _)| n == &fname) {
+                            links.push((fname, abs));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -234,6 +290,203 @@ struct AppMatch {
     name:     String,
     platform: String,
     url:      String,
+}
+
+/// A shell install script detected on a page (e.g. `curl ... | bash`).
+struct CurlInstall {
+    url:          String,
+    display_name: String,
+}
+
+/// Returns true if the page is a DuckDuckGo CAPTCHA challenge (not real results).
+fn is_ddg_captcha(html: &str) -> bool {
+    html.contains("anomaly-modal") && html.contains("challenge")
+}
+
+/// Scrape a page for curl/wget install scripts.
+/// Looks for: links to .sh files, and `curl/wget ... | bash` patterns in code blocks.
+fn extract_curl_installs(html: &str, base_url: &str) -> Vec<CurlInstall> {
+    let mut installs: Vec<CurlInstall> = Vec::new();
+    let document = Html::parse_document(html);
+
+    // 1. <a href="..."> pointing to .sh scripts
+    if let Ok(a_sel) = Selector::parse("a[href]") {
+        for el in document.select(&a_sel) {
+            if let Some(href) = el.value().attr("href") {
+                let href_lower = href.to_lowercase();
+                if href_lower.ends_with(".sh") {
+                    if let Some(abs) = resolve_url(base_url, href) {
+                        if !installs.iter().any(|i| i.url == abs) {
+                            installs.push(CurlInstall {
+                                display_name: format!("curl {} | bash", abs),
+                                url:          abs,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Regex: curl/wget ... | bash/zsh patterns in code blocks
+    let cmd_re = Regex::new(
+        r#"(?:curl|wget)\s+[^\s|<>"]+\s*(?:\|[^\s<>"]*)*\s*\|\s*(?:sudo\s+)?(?:ba)?sh"#
+    ).unwrap();
+    let url_re = Regex::new(r#"(https?://[^\s|<>"]+)"#).unwrap();
+    for cap in cmd_re.captures_iter(html) {
+        let cmd = cap[0].trim().to_string();
+        // Extract the URL from the command
+        if let Some(url_cap) = url_re.captures(&cmd) {
+            let script_url = url_cap[1].to_string();
+            if !installs.iter().any(|i| i.url == script_url) {
+                installs.push(CurlInstall {
+                    display_name: cmd,
+                    url:          script_url,
+                });
+            }
+        }
+    }
+
+    installs
+}
+
+// ─── Search Parser ──────────────────────────────────────────────────────────
+
+fn parse_search_html(html: &str, query: &str) -> Vec<AppMatch> {
+    let document = Html::parse_document(html);
+    let mut seen_urls: Vec<String> = Vec::new();
+    let query_lower = query.to_lowercase();
+    let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+
+    // Sites that are tutorials, not actual download pages
+    let tutorial_sites = [
+        "linuxcapable.com", "itsfoss.com", "linuxconfig.org", "pkgs.org",
+        "libtechnophile.blogspot.com", "tecmint.com", "fosslinux.com",
+        "linuxbite.com", "debugpoint.com", "addictivetips.com",
+        "cyberpanel.net", "support.brave.app",
+    ];
+
+    // Collect (score, AppMatch) for sorting
+    let mut scored: Vec<(i32, AppMatch)> = Vec::new();
+
+    let link_sel = Selector::parse("a[href]").unwrap();
+    for el in document.select(&link_sel) {
+        // DDG uses data-href, Brave uses href — try both
+        let href = el.value().attr("data-href")
+            .or_else(|| el.value().attr("href"))
+            .unwrap_or("")
+            .to_string();
+
+        if href.is_empty()
+            || href.contains("duckduckgo.com")
+            || href.contains("search.brave.com")
+            || href.contains("search.brave.")
+            || href.contains("github.com")
+            || href.contains("flathub.org")
+            || href.contains("youtube.com")
+            || href.contains("reddit.com")
+            || href.contains("stackoverflow.com")
+            || href.contains("wikipedia.org")
+            || href.contains("snapcraft.io")
+        {
+            continue;
+        }
+
+        if !href.starts_with("http") { continue; }
+
+        let parsed = match url::Url::parse(&href) {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let domain = parsed.host_str().unwrap_or("").to_string();
+        if domain.is_empty() { continue; }
+
+        // Extract link text (the visible page title from the search result)
+        let title = el.text().collect::<Vec<_>>().join(" ").trim().to_string();
+
+        // Filter: skip if title contains obvious non-download signals
+        let lower_title = title.to_lowercase();
+        let skip_keywords = ["sign in", "sign up", "login", "register", "cart",
+            "shopping", "pricing", "subscribe", "jobs", "careers", "contact"];
+        if skip_keywords.iter().any(|k| lower_title.contains(k)) {
+            continue;
+        }
+
+        let dedup_key = if href.contains("github.com") {
+            href.clone()
+        } else {
+            domain.clone()
+        };
+        if seen_urls.contains(&dedup_key) { continue; }
+        seen_urls.push(dedup_key);
+
+        // ── Score relevance ─────────────────────────────────────────────────
+        let mut score: i32 = 0;
+
+        // +10 per query word found in title or URL
+        for w in &query_words {
+            if lower_title.contains(*w) { score += 10; }
+            if href.to_lowercase().contains(*w) { score += 5; }
+        }
+
+        // +15 if the URL path or title contains "download"
+        let path = parsed.path().to_lowercase();
+        if lower_title.contains("download") || path.contains("download") {
+            score += 15;
+        }
+        if lower_title.contains("install") || path.contains("install") {
+            score += 5;
+        }
+
+        // +10 if the domain name contains the query (e.g. obsidian.md for "obsidian")
+        if query_words.iter().any(|w| domain.contains(w)) {
+            score += 10;
+        }
+
+        // +5 for a "/" or "/download" path (home page or download page)
+        if path == "/" || path == "/download" || path == "/downloads" {
+            score += 5;
+        }
+
+        // -30 for known tutorial/blog sites
+        if tutorial_sites.iter().any(|s| domain.contains(s)) {
+            score -= 30;
+        }
+
+        let display_name = if !title.is_empty() && title.len() > 3 {
+            let t = if title.chars().count() > 55 {
+                format!("{}…", title.chars().take(52).collect::<String>())
+            } else {
+                title.clone()
+            };
+            format!("🌐 {} ({})", t, domain)
+        } else {
+            let clean = domain.replace(".com", "").replace(".org", "")
+                .replace(".io", "").replace("-", " ").trim().to_string();
+            let cap = clean.split_whitespace()
+                .map(|w| {
+                    let mut c = w.chars();
+                    match c.next() {
+                        None => String::new(),
+                        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("🌐 {} ({})", cap, domain)
+        };
+
+        scored.push((score, AppMatch {
+            name:     display_name,
+            url:      href,
+            platform: "Web".to_string(),
+        }));
+    }
+
+    // Sort by score descending
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.truncate(5);
+    scored.into_iter().map(|(_, m)| m).collect()
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -266,35 +519,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Build HTTP client ─────────────────────────────────────────────────────
     let client = build_client()?;
 
-    println!("🔍 Searching GitHub (stars), Flathub, and Web for '{}'...", search_query);
+    println!("🔍 Searching GitHub and Web for '{}'...", search_query);
 
     // ── Concurrent search ─────────────────────────────────────────────────────
 
-    // 1. GitHub — sorted by stars so popular/official repos bubble first
+    // 1. GitHub — search by name so irrelevant repos don't leak in
     let gh_url = format!(
-        "https://api.github.com/search/repositories?q={}&sort=stars&order=desc",
+        "https://api.github.com/search/repositories?q={}+in:name&sort=stars&order=desc",
         urlencoding::encode(&search_query)
     );
     let gh_req = client.get(&gh_url).send();
 
-    // 2. DuckDuckGo HTML endpoint — no JS needed, much more scraper-friendly than Yahoo
-    let ddg_url = format!(
-        "https://html.duckduckgo.com/html/?q={}+official+linux+download+site",
+    // 2. Web search — concurrent with GitHub
+    let brave_url1 = format!(
+        "https://search.brave.com/search?q={}+linux+download&hl=en",
         urlencoding::encode(&search_query)
     );
-    let web_req = client.get(&ddg_url).send();
+    let web_req = client.get(&brave_url1).send();
 
-    // 3. Flatpak CLI
-    let sq_clone = search_query.clone();
-    let flatpak_task = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("flatpak")
-            .args(["search", "--columns=application", &sq_clone])
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-    });
-
-    let (gh_res, web_res, flatpak_out) = tokio::join!(gh_req, web_req, flatpak_task);
+    let (gh_res, web_res) = tokio::join!(gh_req, web_req);
 
     let mut all_matches: Vec<AppMatch> = Vec::new();
 
@@ -316,99 +559,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // ── Parse Flatpak ─────────────────────────────────────────────────────────
-    if let Ok(Some(stdout)) = flatpak_out {
-        let app_id_re = Regex::new(r"^[a-zA-Z][a-zA-Z0-9_-]+\.[a-zA-Z][a-zA-Z0-9_.-]+$").unwrap();
-        let mut count = 0;
-        for line in stdout.lines() {
-            if count >= 3 { break; }
-            let id = line.trim().to_string();
-            if app_id_re.is_match(&id) {
-                all_matches.push(AppMatch {
-                    name:     id.clone(),
-                    url:      id,
-                    platform: "Flathub".to_string(),
-                });
-                count += 1;
+    // ── Parse Web Search (Brave first, retry with simpler query, DDG fallback) ─
+    let mut web_matches = Vec::new();
+
+    // Brave attempt 1 (concurrent with GitHub)
+    match web_res {
+        Ok(resp) => match resp.text().await {
+            Ok(html) => { web_matches = parse_search_html(&html, &search_query); }
+            Err(_) => {}
+        },
+        Err(_) => {}
+    }
+
+    // Brave attempt 2 (retry with simpler query if 1st was empty)
+    if web_matches.is_empty() {
+        let url = format!(
+            "https://search.brave.com/search?q={}+download&hl=en",
+            urlencoding::encode(&search_query)
+        );
+        if let Ok(resp) = client.get(&url).send().await {
+            if let Ok(html) = resp.text().await {
+                web_matches = parse_search_html(&html, &search_query);
             }
         }
     }
 
-    // ── Parse DuckDuckGo HTML ─────────────────────────────────────────────────
-    if let Ok(resp) = web_res {
-        if let Ok(html) = resp.text().await {
-            let document = Html::parse_document(&html);
-            let mut seen_domains: Vec<String> = Vec::new();
-            let mut count = 0;
-
-            // DDG HTML results: result links are in <a class="result__a"> or <a class="result__url">
-            // Real URL is in data-href or the href itself (not redirect-wrapped like Yahoo)
-            let link_sel = Selector::parse("a.result__a, a.result__url").unwrap();
-            for el in document.select(&link_sel) {
-                if count >= 5 { break; }  // Show more web results
-
-                // Try data-href first (DDG sometimes puts the real URL there)
-                let href = el.value().attr("data-href")
-                    .or_else(|| el.value().attr("href"))
-                    .unwrap_or("")
-                    .to_string();
-
-                if href.is_empty()
-                    || href.contains("duckduckgo.com")
-                    || href.contains("github.com")
-                    || href.contains("flathub.org")
-                    || href.contains("youtube.com")
-                    || href.contains("reddit.com")
-                    || href.contains("stackoverflow.com")
-                    || href.contains("wikipedia.org")
-                    || href.contains("snapcraft.io")
-                {
-                    continue;
+    if web_matches.is_empty() {
+        let ddg_url = format!(
+            "https://html.duckduckgo.com/html/?q={}+linux+download+install",
+            urlencoding::encode(&search_query)
+        );
+        match client.get(&ddg_url).send().await {
+            Ok(resp) => match resp.text().await {
+                Ok(html) => {
+                    if !is_ddg_captcha(&html) {
+                        web_matches = parse_search_html(&html, &search_query);
+                    }
                 }
-
-                let final_url = if href.starts_with("//duckduckgo.com/l/?uddg=") {
-                    // DDG redirect — decode the uddg= param
-                    href.split("uddg=")
-                        .nth(1)
-                        .and_then(|s| s.split('&').next())
-                        .and_then(|enc| urlencoding::decode(enc).ok())
-                        .map(|s| s.to_string())
-                        .unwrap_or(href.clone())
-                } else {
-                    href
-                };
-
-                if !final_url.starts_with("http") { continue; }
-
-                let domain = url::Url::parse(&final_url)
-                    .ok()
-                    .and_then(|u| u.host_str().map(|h| h.to_string()))
-                    .unwrap_or_default();
-
-                if domain.is_empty() || seen_domains.contains(&domain) { continue; }
-                seen_domains.push(domain.clone());
-
-                // For now, just use the domain as description
-                // (Title extraction would require more complex HTML parsing)
-                let description = domain.clone();
-
-                // Clean up the description
-                let clean_description = description
-                    .replace("Download", "")
-                    .replace("download", "")
-                    .replace("|", " - ")
-                    .trim()
-                    .to_string();
-
-                all_matches.push(AppMatch {
-                    name:     format!("🌐 {} ({})", clean_description, domain),
-                    url:      final_url,
-                    platform: "Web".to_string(),
-                });
-                count += 1;
-            }
+                Err(_) => {}
+            },
+            Err(_) => {}
         }
     }
+    all_matches.extend(web_matches);
 
     if all_matches.is_empty() {
         println!("❌ No results found. Try a more specific name or paste the direct URL.");
@@ -434,17 +627,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match chosen.platform.as_str() {
         "GitHub" => {
             handle_github(&client, &chosen.url, &chosen.name, &distro).await?;
-        }
-        "Flathub" => {
-            println!("📦 Preparing to install Flathub package: {}", chosen.name);
-            if !confirm_sudo_operation("install this Flatpak package")? {
-                println!("🚫 Installation cancelled by user.");
-                return Ok(());
-            }
-            println!("📦 Running flatpak install...");
-            std::process::Command::new("flatpak")
-                .args(["install", "flathub", &chosen.url, "-y"])
-                .status()?;
         }
         "Web" => {
             handle_direct_url(&client, &chosen.url, &distro).await?;
@@ -505,7 +687,68 @@ async fn handle_direct_url(
         }
     }
 
-    // Step 3: GitHub Pivot — if still empty, look for a github.com/owner/repo in the HTML
+    // Step 2b: If still no links, try common download page patterns automatically
+    if links.is_empty() {
+        println!("  ↳ Trying common download page patterns...");
+        let download_urls_to_try = vec![
+            format!("{}/download", final_url.trim_end_matches('/')),
+            format!("{}/downloads", final_url.trim_end_matches('/')),
+            format!("{}/Download", final_url.trim_end_matches('/')),
+        ];
+
+        for dl_url in download_urls_to_try {
+            println!("  ↳ Checking: {}", dl_url);
+            if let Ok(resp2) = client.get(&dl_url).send().await {
+                if resp2.status().is_success() {
+                    if let Ok(html2) = resp2.text().await {
+                        links = scrape_download_links(&html2, &dl_url, distro);
+                        if !links.is_empty() {
+                            println!("  ↳ Found {} binaries on download page!", links.len());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 3: Special handling for well-known sites
+    if links.is_empty() {
+        println!("  ↳ Trying special handling for well-known sites...");
+        if final_url.contains("code.visualstudio.com") || url.contains("code.visualstudio.com") {
+            println!("  ↳ Detected VS Code website — using direct download URLs");
+            // VS Code download URLs follow a known pattern
+            let arch = if cfg!(target_arch = "x86_64") { "x64" } else { "arm64" };
+
+            // Try to get the latest version from the updates API
+            let versions_url = "https://update.code.visualstudio.com/api/releases/stable";
+            if let Ok(resp) = client.get(versions_url).send().await {
+                if let Ok(versions_json) = resp.json::<serde_json::Value>().await {
+                    // The API returns a JSON array like ["1.xx.x"]
+                    if let Some(version) = versions_json.as_array()
+                        .and_then(|arr| arr.first())
+                        .and_then(|v| v.as_str())
+                    {
+                        let base_url = format!(
+                            "https://update.code.visualstudio.com/{}/linux-{}/stable",
+                            version, arch
+                        );
+
+                        // Add both .deb and .rpm URLs
+                        let deb_url = format!("{}/code-stable-{}-linux-{}.deb", base_url, version, arch);
+                        let rpm_url = format!("{}/code-stable-{}-linux-{}.rpm", base_url, version, arch);
+
+                        links.push((format!("code-stable-{}-linux-{}.deb", version, arch), deb_url));
+                        links.push((format!("code-stable-{}-linux-{}.rpm", version, arch), rpm_url));
+
+                        println!("  ↳ Found VS Code {} for Linux {}", version, arch);
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 4: GitHub Pivot — if still empty, look for a github.com/owner/repo in the HTML
     if links.is_empty() {
         println!("  ↳ No binaries found. Attempting GitHub Pivot...");
         if let Some(repo) = extract_github_repo(&html) {
@@ -514,6 +757,21 @@ async fn handle_direct_url(
             handle_github(client, &releases_url, &repo, distro).await?;
             return Ok(());
         }
+
+        // Step 5: Curl install script detection
+        println!("  ↳ No binaries or GitHub repo found. Checking for install scripts...");
+        let curl_installs = extract_curl_installs(&html, &final_url);
+        if !curl_installs.is_empty() {
+            println!("  ↳ Found {} install script(s).", curl_installs.len());
+            let options: Vec<String> = curl_installs.iter().map(|c| format!("📜 {}", c.display_name)).collect();
+            let sel = Select::with_theme(&ColorfulTheme::default())
+                .with_prompt("Select install script")
+                .items(&options)
+                .default(0)
+                .interact()?;
+            return execute_curl_install(&curl_installs[sel]).await;
+        }
+
         println!("❌ Could not find any installable binary for this page.");
         println!("   Try: sit https://github.com/<owner>/<repo>");
         return Ok(());
@@ -577,6 +835,71 @@ async fn handle_direct_url(
     execute_install(client, fname, furl, &app_name, distro).await
 }
 
+// ─── Curl Install Script Handler ─────────────────────────────────────────────
+
+async fn execute_curl_install(install: &CurlInstall) -> Result<(), Box<dyn std::error::Error>> {
+    use dialoguer::Confirm;
+
+    let script_fname = extract_fname(&install.url);
+    let tmp_dir = "/tmp/sit-downloads";
+    std::fs::create_dir_all(tmp_dir)?;
+    let dest = format!("{}/{}", tmp_dir, script_fname);
+
+    println!("⬇  Downloading install script...");
+    let dl_ok = std::process::Command::new("curl")
+        .args(["-fsSL", "-o", &dest, &install.url])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if !dl_ok || !std::path::Path::new(&dest).exists() {
+        println!("❌ Failed to download script from {}", install.url);
+        return Ok(());
+    }
+
+    // Show the script content with line numbers so user can review
+    if let Ok(content) = std::fs::read_to_string(&dest) {
+        println!("\n📜 Script content ({} lines):", content.lines().count());
+        println!("───────────────────────────────────────");
+        for (i, line) in content.lines().enumerate() {
+            println!("{:>4} │ {}", i + 1, line);
+        }
+        println!("───────────────────────────────────────");
+    }
+
+    println!("\nWould run: sudo bash {}", dest);
+    if !Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt("Execute this script?")
+        .default(false)
+        .interact()?
+    {
+        println!("🚫 Cancelled. Script kept at {}", dest);
+        return Ok(());
+    }
+
+    println!("🚀 Running script...");
+    let status = std::process::Command::new("sudo")
+        .args(["bash", &dest])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            std::fs::remove_file(&dest).ok();
+            println!("✅ Install script completed successfully.");
+        }
+        Ok(s) => {
+            println!("❌ Script exited with status: {}", s);
+            println!("   Script kept at {} for inspection.", dest);
+        }
+        Err(e) => {
+            println!("❌ Failed to run script: {}", e);
+            println!("   Script kept at {} for inspection.", dest);
+        }
+    }
+
+    Ok(())
+}
+
 // ─── GitHub Release Handler ───────────────────────────────────────────────────
 
 async fn handle_github(
@@ -634,7 +957,7 @@ async fn handle_github(
         .interact()?;
 
     let (fname, furl) = &valid[sel];
-    let app_name = repo_label.split('/').last().unwrap_or("app").to_string();
+    let app_name = repo_label.split('/').next_back().unwrap_or("app").to_string();
     execute_install(client, fname, furl, &app_name, distro).await
 }
 
@@ -656,23 +979,25 @@ async fn execute_install(
     println!("⬇  Downloading {} ...", name);
     println!("   → {}", dest);
 
-    let dl_status = std::process::Command::new("axel")
-        .args(["-n", "8", "-a", url, "-o", &dest])
-        .status();
+    // ponytail: curl first (reliable single-connection), axel only for large files
+    // where multi-connection actually helps. GitHub CDN throttles axel.
+    let curl_ok = std::process::Command::new("curl")
+        .args(["-L", "--progress-bar", "-o", &dest, url])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
 
-    match dl_status {
-        Ok(s) if s.success() => {}
-        _ => {
-            println!("⚠  axel failed or not installed. Falling back to curl...");
-            let curl_ok = std::process::Command::new("curl")
-                .args(["-L", "--progress-bar", "-o", &dest, url])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !curl_ok {
-                println!("❌ Download failed.");
-                return Ok(());
-            }
+    if !curl_ok {
+        // Fallback: try axel with fewer connections
+        println!("⚠  curl failed. Trying axel...");
+        let axel_ok = std::process::Command::new("axel")
+            .args(["-n", "4", "-a", url, "-o", &dest])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !axel_ok {
+            println!("❌ Download failed.");
+            return Ok(());
         }
     }
 
@@ -702,7 +1027,10 @@ async fn execute_install(
         install_rpm(&dest, distro)?;
 
     } else if n.ends_with(".tar.gz") || n.ends_with(".tar.xz") || n.ends_with(".tar.bz2") {
-        install_tarball(&dest, app_short_name, &home, &local_bin, &apps_dir)?;
+        install_archive(&dest, app_short_name, &home, &local_bin, &apps_dir)?;
+
+    } else if n.ends_with(".zip") {
+        install_archive(&dest, app_short_name, &home, &local_bin, &apps_dir)?;
     }
 
     // Refresh desktop DB so the app appears in GNOME / KDE menus
@@ -739,7 +1067,7 @@ fn install_deb(
 
     // Show package details and ask for confirmation
     if let Ok(metadata) = std::fs::metadata(name) {
-        println!("   Package: {}", name.split('/').last().unwrap_or(name));
+        println!("   Package: {}", name.split('/').next_back().unwrap_or(name));
         println!("   Size: {} bytes", metadata.len());
     }
 
@@ -794,7 +1122,7 @@ fn install_rpm(
 
     // Show package details and ask for confirmation
     if let Ok(metadata) = std::fs::metadata(name) {
-        println!("   Package: {}", name.split('/').last().unwrap_or(name));
+        println!("   Package: {}", name.split('/').next_back().unwrap_or(name));
         println!("   Size: {} bytes", metadata.len());
     }
 
@@ -830,7 +1158,7 @@ fn install_rpm(
     Ok(())
 }
 
-fn install_tarball(
+fn install_archive(
     name: &str,
     app_short_name: &str,
     home: &str,
@@ -845,42 +1173,40 @@ fn install_tarball(
     }
     std::fs::create_dir_all(&opt_dir)?;
 
-    // Pick the right tar flag for the compression type
-    let compress_flag = if name.ends_with(".tar.gz") { "-xzf" }
-        else if name.ends_with(".tar.xz")  { "-xJf" }
-        else { "-xjf" }; // .tar.bz2
-
     println!("📦 Extracting {} to {}", name, opt_dir);
-    let tar_status = std::process::Command::new("tar")
-        .args([compress_flag, name, "-C", &opt_dir, "--strip-components=1"])
-        .status()?;
 
-    if !tar_status.success() {
-        return Err(format!("Failed to extract tarball: {}", name).into());
+    // Extract based on format
+    let n = name.to_lowercase();
+    let status = if n.ends_with(".zip") {
+        std::process::Command::new("unzip")
+            .args(["-q", name, "-d", &opt_dir])
+            .status()?
+    } else {
+        // tar: pick the right compression flag
+        let flag = if n.ends_with(".tar.gz") { "-xzf" }
+            else if n.ends_with(".tar.xz")  { "-xJf" }
+            else { "-xjf" }; // .tar.bz2
+        std::process::Command::new("tar")
+            .args([flag, name, "-C", &opt_dir, "--strip-components=1"])
+            .status()?
+    };
+
+    if !status.success() {
+        return Err(format!("Failed to extract: {}", name).into());
     }
 
-    // Remove the downloaded file after successful extraction
     std::fs::remove_file(name)?;
 
-    // Find the primary executable using a more robust Rust-based approach
+    // Find the primary executable, create symlink + desktop file
     let bin_path = find_executable_in_directory(&opt_dir, app_short_name);
 
     if let Some(ref bin_path) = bin_path {
         let symlink = format!("{}/{}", local_bin, app_short_name);
 
-        // Remove stale symlink before creating a new one
         if std::path::Path::new(&symlink).exists() {
             std::fs::remove_file(&symlink)?;
         }
-
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(bin_path, &symlink)?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::os::windows::fs::symlink_file(bin_path, symlink)?;
-        }
+        std::os::unix::fs::symlink(bin_path, &symlink)?;
 
         write_desktop_file(apps_dir, app_short_name, bin_path)?;
         println!("✅ Extracted to {}.", opt_dir);
