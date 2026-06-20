@@ -618,6 +618,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_prompt("Select source to install from")
         .items(&display_options)
         .default(0)
+        .max_length(8)
         .interact()?;
 
     let chosen = &all_matches[selection];
@@ -639,36 +640,126 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // ─── Direct URL Handler ───────────────────────────────────────────────────────
 
+/// Fetch a URL and return (final_url, html).
+async fn fetch_page(client: &reqwest::Client, url: &str) -> Result<(String, String), ()> {
+    let resp = client.get(url).send().await.map_err(|_| ())?;
+    let final_url = resp.url().to_string();
+    let html = resp.text().await.map_err(|_| ())?;
+    Ok((final_url, html))
+}
+
+/// Present a unified menu of download links + curl install scripts.
+/// Returns "download" → calls execute_install, "curl" → calls execute_curl_install.
+async fn pick_install(
+    client: &reqwest::Client,
+    links: &[(String, String)],
+    curl_installs: &[CurlInstall],
+    distro: &Distro,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let total = links.len() + curl_installs.len();
+
+    if total == 0 {
+        return Ok(());
+    }
+
+    // Build unified menu
+    let mut sorted = links.to_vec();
+    sort_assets(&mut sorted, distro);
+    let best_index = if sorted.is_empty() { None } else { Some(auto_select_best_package(&sorted, distro)) };
+
+    let mut names: Vec<String> = Vec::new();
+    let mut choices: Vec<(&str, &str, String)> = Vec::new(); // ("download"|"curl", name, url)
+
+    for (i, (fname, furl)) in sorted.iter().enumerate() {
+        let check = if best_index == Some(i) { "✓ " } else { "  " };
+        let icon = if fname.to_lowercase().ends_with(".appimage") { " 🐧" } else { " 📦" };
+        names.push(format!("{}{}{}", check, fname, icon));
+        choices.push(("download", fname, furl.clone()));
+    }
+    for ci in curl_installs {
+        names.push(format!("  📜 {}", ci.display_name));
+        choices.push(("curl", &ci.display_name, ci.url.clone()));
+    }
+
+    // Auto-select if only one option
+    if total == 1 {
+        let (kind, fname, url) = &choices[0];
+        match *kind {
+            "download" => {
+                let app_name = fname.split('_').next()
+                    .and_then(|s| s.split('-').next())
+                    .unwrap_or("app").to_string();
+                println!("🎯 {}", names[0]);
+                return execute_install(client, fname, url, &app_name, distro).await;
+            }
+            "curl" => {
+                println!("🎯 {}", names[0]);
+                return execute_curl_install(&CurlInstall { url: url.clone(), display_name: fname.to_string() }).await;
+            }
+            _ => {}
+        }
+    }
+
+    println!();
+    let sel = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select installation method")
+        .items(&names)
+        .default(best_index.unwrap_or(0))
+        .max_length(8)
+        .interact()?;
+
+    let (kind, fname, url) = &choices[sel];
+    match *kind {
+        "download" => {
+            let app_name = fname.split('_').next()
+                .and_then(|s| s.split('-').next())
+                .unwrap_or("app").to_string();
+            execute_install(client, fname, url, &app_name, distro).await
+        }
+        "curl" => {
+            execute_curl_install(&CurlInstall { url: url.clone(), display_name: fname.to_string() }).await
+        }
+        _ => Ok(()),
+    }
+}
+
 async fn handle_direct_url(
     client: &reqwest::Client,
     url: &str,
     distro: &Distro,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("📄 Fetching page: {}", url);
-    let resp = client.get(url).send().await?;
-    let final_url = resp.url().to_string(); // follow redirects
-    let html = resp.text().await?;
+    let (final_url, html) = match fetch_page(client, url).await {
+        Ok(v) => v,
+        Err(_) => {
+            println!("❌ Failed to fetch page: {}", url);
+            return Ok(());
+        }
+    };
 
-    // Step 1: Try scraping the landing page directly
+    println!("📄 Fetched: {}", final_url);
+
+    // Scrape download links + curl install scripts from the landing page
     let mut links = scrape_download_links(&html, &final_url, distro);
+    let mut curl_installs = extract_curl_installs(&html, &final_url);
 
-    // Step 2: No links found — look for a "download" sub-page link
-    if links.is_empty() {
-        println!("  ↳ No binaries on landing page. Looking for a /download page...");
+    // If no direct links, try finding a /download sub-page
+    if links.is_empty() && curl_installs.is_empty() {
+        println!("  ↪ Looking for a download page...");
         let document = Html::parse_document(&html);
         let a_sel = Selector::parse("a[href]").unwrap();
-        let mut download_page_url: Option<String> = None;
+        let mut sub_url: Option<String> = None;
 
         for el in document.select(&a_sel) {
             if let Some(href) = el.value().attr("href") {
                 let text = el.text().collect::<String>().to_lowercase();
                 let href_lower = href.to_lowercase();
-                if text.contains("download") || href_lower.contains("download") || href_lower.contains("releases") {
+                if (text.contains("download") || href_lower.contains("download") || href_lower.contains("releases"))
+                    && !href_lower.contains("reddit") && !href_lower.contains("youtube")
+                {
                     if let Some(abs) = resolve_url(&final_url, href) {
-                        // Avoid external sites
-                        if let (Ok(base_u), Ok(link_u)) = (url::Url::parse(url), url::Url::parse(&abs)) {
+                        if let (Ok(base_u), Ok(link_u)) = (url::Url::parse(&final_url), url::Url::parse(&abs)) {
                             if base_u.host_str() == link_u.host_str() {
-                                download_page_url = Some(abs);
+                                sub_url = Some(abs);
                                 break;
                             }
                         }
@@ -677,145 +768,56 @@ async fn handle_direct_url(
             }
         }
 
-        if let Some(dl_url) = download_page_url {
-            println!("  ↳ Scraping download page: {}", dl_url);
-            if let Ok(resp2) = client.get(&dl_url).send().await {
-                if let Ok(html2) = resp2.text().await {
-                    links = scrape_download_links(&html2, &dl_url, distro);
+        if let Some(ref dl_url) = sub_url {
+            if let Ok((_, html2)) = fetch_page(client, dl_url).await {
+                links = scrape_download_links(&html2, dl_url, distro);
+                curl_installs = extract_curl_installs(&html2, dl_url);
+            }
+        }
+    }
+
+    // Still nothing? Try common download page paths
+    if links.is_empty() && curl_installs.is_empty() && !final_url.to_lowercase().contains("download") {
+        println!("  ↪ Trying common download paths...");
+        for suffix in ["/download", "/downloads", "/Download"] {
+            let try_url = format!("{}{}", final_url.trim_end_matches('/'), suffix);
+            if let Ok((_, html2)) = fetch_page(client, &try_url).await {
+                links = scrape_download_links(&html2, &try_url, distro);
+                curl_installs = extract_curl_installs(&html2, &try_url);
+                if !links.is_empty() || !curl_installs.is_empty() {
+                    break;
                 }
             }
         }
     }
 
-    // Step 2b: If still no links, try common download page patterns automatically
-    // Skip if URL already contains "download" — we're already on a download page
-    if links.is_empty() && !final_url.to_lowercase().contains("download") {
-        println!("  ↳ Trying common download page patterns...");
-        let download_urls_to_try = vec![
-            format!("{}/download", final_url.trim_end_matches('/')),
-            format!("{}/downloads", final_url.trim_end_matches('/')),
-            format!("{}/Download", final_url.trim_end_matches('/')),
-        ];
-
-        for dl_url in download_urls_to_try {
-            println!("  ↳ Checking: {}", dl_url);
-            if let Ok(resp2) = client.get(&dl_url).send().await {
-                if resp2.status().is_success() {
-                    if let Ok(html2) = resp2.text().await {
-                        links = scrape_download_links(&html2, &dl_url, distro);
-                        if !links.is_empty() {
-                            println!("  ↳ Found {} binaries on download page!", links.len());
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+    // Special handling for well-known sites
+    if links.is_empty() && curl_installs.is_empty()
+        && (final_url.contains("code.visualstudio.com") || url.contains("code.visualstudio.com"))
+    {
+        println!("  ↪ Detected VS Code — using direct download URL");
+        let (pkg_ext, pkg_url) = match distro {
+            Distro::Ubuntu => ("deb", "https://update.code.visualstudio.com/latest/linux-deb-x64/stable"),
+            Distro::Fedora => ("rpm", "https://update.code.visualstudio.com/latest/linux-rpm-x64/stable"),
+            Distro::Unknown => ("tar.gz", "https://update.code.visualstudio.com/latest/linux-x64/stable"),
+        };
+        links.push((format!("code.{}", pkg_ext), pkg_url.to_string()));
     }
 
-    // Step 3: Special handling for well-known sites
-    if links.is_empty() {
-        println!("  ↳ Trying special handling for well-known sites...");
-        if final_url.contains("code.visualstudio.com") || url.contains("code.visualstudio.com") {
-            println!("  ↳ Detected VS Code website — using direct download URLs");
-            // VS Code download URLs redirect to the actual binary.
-            // `latest` resolves to the current version automatically.
-            let (pkg_ext, pkg_url) = match distro {
-                Distro::Ubuntu => ("deb", "https://update.code.visualstudio.com/latest/linux-deb-x64/stable"),
-                Distro::Fedora => ("rpm", "https://update.code.visualstudio.com/latest/linux-rpm-x64/stable"),
-                Distro::Unknown => ("tar.gz", "https://update.code.visualstudio.com/latest/linux-x64/stable"),
-            };
-            let fname = format!("code.{}", pkg_ext);
-            links.push((fname, pkg_url.to_string()));
-            println!("  ↳ VS Code {} package ready", pkg_ext);
-        }
-    }
-
-    // Step 4: GitHub Pivot — if still empty, look for a github.com/owner/repo in the HTML
-    if links.is_empty() {
-        println!("  ↳ No binaries found. Attempting GitHub Pivot...");
+    // GitHub pivot — if any github.com/owner/repo link exists on the page
+    if links.is_empty() && curl_installs.is_empty() {
         if let Some(repo) = extract_github_repo(&html) {
-            println!("  ↳ Found GitHub repo: {}. Fetching its releases...", repo);
+            println!("  ↪ GitHub repo found: {}", repo);
             let releases_url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-            handle_github(client, &releases_url, &repo, distro).await?;
-            return Ok(());
+            return handle_github(client, &releases_url, &repo, distro).await;
         }
-
-        // Step 5: Curl install script detection
-        println!("  ↳ No binaries or GitHub repo found. Checking for install scripts...");
-        let curl_installs = extract_curl_installs(&html, &final_url);
-        if !curl_installs.is_empty() {
-            println!("  ↳ Found {} install script(s).", curl_installs.len());
-            let options: Vec<String> = curl_installs.iter().map(|c| format!("📜 {}", c.display_name)).collect();
-            let sel = Select::with_theme(&ColorfulTheme::default())
-                .with_prompt("Select install script")
-                .items(&options)
-                .default(0)
-                .interact()?;
-            return execute_curl_install(&curl_installs[sel]).await;
-        }
-
-        println!("❌ Could not find any installable binary for this page.");
+        println!("❌ No installable packages or scripts found on this page.");
         println!("   Try: sit https://github.com/<owner>/<repo>");
         return Ok(());
     }
 
-    // Step 4: Auto-select best package or present choices
-    sort_assets(&mut links, distro);
-
-    let (fname, furl) = if links.is_empty() {
-        println!("❌ No installable packages found.");
-        return Ok(());
-    } else if links.len() == 1 {
-        // Only one option - auto-select it
-        println!("🎯 Found single package: {}", links[0].0);
-        (&links[0].0, &links[0].1)
-    } else {
-        // Multiple options - try to auto-select the best one
-        let best_index = auto_select_best_package(&links, distro);
-        let best_package = &links[best_index].0;
-
-        println!("🤖 Auto-selected best package: {}", best_package);
-        println!("   (You can change this selection if needed)");
-
-        // Show all options with the best one pre-selected
-        let names: Vec<String> = links.iter().enumerate().map(|(i, (n, _))| {
-            let n_lower = n.to_lowercase();
-            let mut display_name = String::new();
-
-            if i == best_index {
-                display_name.push_str("✓ ");
-            } else {
-                display_name.push_str("  ");
-            }
-
-            if n_lower.ends_with(".appimage") {
-                display_name.push_str(&format!("{} 🐧", n));
-            } else if n_lower.ends_with(".deb") {
-                display_name.push_str(&format!("{} 📦", n));
-            } else if n_lower.ends_with(".rpm") {
-                display_name.push_str(&format!("{} 📦", n));
-            } else {
-                display_name.push_str(&format!("{} 📦", n));
-            }
-
-            display_name
-        }).collect();
-
-        let sel = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Select binary to install")
-            .items(&names)
-            .default(best_index)
-            .interact()?;
-        (&links[sel].0, &links[sel].1)
-    };
-    let app_name = fname
-        .split('_').next()
-        .and_then(|s| s.split('-').next())
-        .unwrap_or("app")
-        .to_string();
-
-    execute_install(client, fname, furl, &app_name, distro).await
+    // Present combined menu
+    pick_install(client, &links, &curl_installs, distro).await
 }
 
 // ─── Curl Install Script Handler ─────────────────────────────────────────────
@@ -937,6 +939,7 @@ async fn handle_github(
         .with_prompt("Select format to install")
         .items(&names)
         .default(0)
+        .max_length(8)
         .interact()?;
 
     let (fname, furl) = &valid[sel];
