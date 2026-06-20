@@ -1,1 +1,18 @@
+# Rust build artifacts
 /target
+Cargo.lock
+
+# System files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.iml
+
+# Install dest (copied binary)
+sit

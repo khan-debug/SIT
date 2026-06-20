@@ -688,7 +688,8 @@ async fn handle_direct_url(
     }
 
     // Step 2b: If still no links, try common download page patterns automatically
-    if links.is_empty() {
+    // Skip if URL already contains "download" — we're already on a download page
+    if links.is_empty() && !final_url.to_lowercase().contains("download") {
         println!("  ↳ Trying common download page patterns...");
         let download_urls_to_try = vec![
             format!("{}/download", final_url.trim_end_matches('/')),
@@ -717,34 +718,16 @@ async fn handle_direct_url(
         println!("  ↳ Trying special handling for well-known sites...");
         if final_url.contains("code.visualstudio.com") || url.contains("code.visualstudio.com") {
             println!("  ↳ Detected VS Code website — using direct download URLs");
-            // VS Code download URLs follow a known pattern
-            let arch = if cfg!(target_arch = "x86_64") { "x64" } else { "arm64" };
-
-            // Try to get the latest version from the updates API
-            let versions_url = "https://update.code.visualstudio.com/api/releases/stable";
-            if let Ok(resp) = client.get(versions_url).send().await {
-                if let Ok(versions_json) = resp.json::<serde_json::Value>().await {
-                    // The API returns a JSON array like ["1.xx.x"]
-                    if let Some(version) = versions_json.as_array()
-                        .and_then(|arr| arr.first())
-                        .and_then(|v| v.as_str())
-                    {
-                        let base_url = format!(
-                            "https://update.code.visualstudio.com/{}/linux-{}/stable",
-                            version, arch
-                        );
-
-                        // Add both .deb and .rpm URLs
-                        let deb_url = format!("{}/code-stable-{}-linux-{}.deb", base_url, version, arch);
-                        let rpm_url = format!("{}/code-stable-{}-linux-{}.rpm", base_url, version, arch);
-
-                        links.push((format!("code-stable-{}-linux-{}.deb", version, arch), deb_url));
-                        links.push((format!("code-stable-{}-linux-{}.rpm", version, arch), rpm_url));
-
-                        println!("  ↳ Found VS Code {} for Linux {}", version, arch);
-                    }
-                }
-            }
+            // VS Code download URLs redirect to the actual binary.
+            // `latest` resolves to the current version automatically.
+            let (pkg_ext, pkg_url) = match distro {
+                Distro::Ubuntu => ("deb", "https://update.code.visualstudio.com/latest/linux-deb-x64/stable"),
+                Distro::Fedora => ("rpm", "https://update.code.visualstudio.com/latest/linux-rpm-x64/stable"),
+                Distro::Unknown => ("tar.gz", "https://update.code.visualstudio.com/latest/linux-x64/stable"),
+            };
+            let fname = format!("code.{}", pkg_ext);
+            links.push((fname, pkg_url.to_string()));
+            println!("  ↳ VS Code {} package ready", pkg_ext);
         }
     }
 
@@ -979,32 +962,27 @@ async fn execute_install(
     println!("⬇  Downloading {} ...", name);
     println!("   → {}", dest);
 
-    // ponytail: curl first (reliable single-connection), axel only for large files
-    // where multi-connection actually helps. GitHub CDN throttles axel.
-    let curl_ok = std::process::Command::new("curl")
-        .args(["-L", "--progress-bar", "-o", &dest, url])
+    // ponytail: axel exits non-zero when connections drop. Verify the file
+    // actually downloaded (exists + at least 1MB), not just the exit code.
+    std::process::Command::new("axel")
+        .args(["-n", "8", "-a", url, "-o", &dest])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .ok();
 
-    if !curl_ok {
-        // Fallback: try axel with fewer connections
-        println!("⚠  curl failed. Trying axel...");
-        let axel_ok = std::process::Command::new("axel")
-            .args(["-n", "4", "-a", url, "-o", &dest])
+    let file_ok = std::path::Path::new(&dest).exists()
+        && std::fs::metadata(&dest).map(|m| m.len() > 1_000_000).unwrap_or(false);
+
+    if !file_ok {
+        println!("⚠  axel incomplete or unavailable. Falling back to curl...");
+        let curl_ok = std::process::Command::new("curl")
+            .args(["-L", "--progress-bar", "-o", &dest, url])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        if !axel_ok {
+        if !curl_ok {
             println!("❌ Download failed.");
             return Ok(());
         }
-    }
-
-    // Confirm the file actually landed on disk
-    if !std::path::Path::new(&dest).exists() {
-        println!("❌ Download reported success but file not found at {}", dest);
-        return Ok(());
     }
     println!("   ✓ Download complete ({} bytes)",
         std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0));
