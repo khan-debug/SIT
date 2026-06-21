@@ -459,7 +459,7 @@ fn parse_search_html(html: &str, query: &str) -> Vec<AppMatch> {
             } else {
                 title.clone()
             };
-            format!("🌐 {} ({})", t, domain)
+            format!("{} ({})", t, domain)
         } else {
             let clean = domain.replace(".com", "").replace(".org", "")
                 .replace(".io", "").replace("-", " ").trim().to_string();
@@ -473,7 +473,7 @@ fn parse_search_html(html: &str, query: &str) -> Vec<AppMatch> {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            format!("🌐 {} ({})", cap, domain)
+            format!("{} ({})", cap, domain)
         };
 
         scored.push((score, AppMatch {
@@ -505,6 +505,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         args[1..].join(" ")
     };
+
+    // ── Version / self-update ───────────────────────────────────────────────
+    if raw_input == "--version" || raw_input == "-v" {
+        println!("sit v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if raw_input == "--update" || raw_input == "--upgrade" {
+        return self_update().await;
+    }
 
     // ── Direct URL mode ───────────────────────────────────────────────────────
     if raw_input.starts_with("http://") || raw_input.starts_with("https://") {
@@ -618,7 +627,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_prompt("Select source to install from")
         .items(&display_options)
         .default(0)
-        .max_length(8)
         .interact()?;
 
     let chosen = &all_matches[selection];
@@ -671,13 +679,13 @@ async fn pick_install(
     let mut choices: Vec<(&str, &str, String)> = Vec::new(); // ("download"|"curl", name, url)
 
     for (i, (fname, furl)) in sorted.iter().enumerate() {
-        let check = if best_index == Some(i) { "✓ " } else { "  " };
-        let icon = if fname.to_lowercase().ends_with(".appimage") { " 🐧" } else { " 📦" };
+        let check = if best_index == Some(i) { ">" } else { " " };
+        let icon = if fname.to_lowercase().ends_with(".appimage") { " [AppImage]" } else { " [pkg]" };
         names.push(format!("{}{}{}", check, fname, icon));
         choices.push(("download", fname, furl.clone()));
     }
     for ci in curl_installs {
-        names.push(format!("  📜 {}", ci.display_name));
+        names.push(format!("  {}", ci.display_name));
         choices.push(("curl", &ci.display_name, ci.url.clone()));
     }
 
@@ -705,7 +713,6 @@ async fn pick_install(
         .with_prompt("Select installation method")
         .items(&names)
         .default(best_index.unwrap_or(0))
-        .max_length(8)
         .interact()?;
 
     let (kind, fname, url) = &choices[sel];
@@ -939,7 +946,6 @@ async fn handle_github(
         .with_prompt("Select format to install")
         .items(&names)
         .default(0)
-        .max_length(8)
         .interact()?;
 
     let (fname, furl) = &valid[sel];
@@ -1337,6 +1343,65 @@ fn auto_select_best_package(links: &[(String, String)], distro: &Distro) -> usiz
     // Sort by score and return the highest
     scores.sort_by(|a, b| b.1.cmp(&a.1));
     scores.first().map(|(i, _)| *i).unwrap_or(0)
+}
+
+// ─── Self-Update ─────────────────────────────────────────────────────────────
+
+/// Pull latest source, rebuild, and replace the running binary.
+async fn self_update() -> Result<(), Box<dyn std::error::Error>> {
+    let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let src_dir = format!("{}/.local/share/sit-src", home);
+    let local_bin = format!("{}/.local/bin", home);
+
+    // Clone if missing, otherwise pull
+    if std::path::Path::new(&src_dir).exists() {
+        println!("📥 Pulling latest source...");
+        let status = std::process::Command::new("git")
+            .args(["-C", &src_dir, "pull", "--ff-only"])
+            .status()?;
+        if !status.success() {
+            println!("❌ git pull failed — you may have local changes.");
+            return Ok(());
+        }
+    } else {
+        println!("📥 Cloning sit repository...");
+        std::fs::create_dir_all(&src_dir)?;
+        let status = std::process::Command::new("git")
+            .args(["clone", "--depth=1", "https://github.com/khan-debug/SIT.git", &src_dir])
+            .status()?;
+        if !status.success() {
+            println!("❌ Clone failed. Check your internet connection.");
+            return Ok(());
+        }
+    }
+
+    // Build
+    println!("🔨 Rebuilding sit...");
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&src_dir)
+        .status()?;
+    if !status.success() {
+        println!("❌ Build failed.");
+        return Ok(());
+    }
+
+    // Install
+    std::fs::create_dir_all(&local_bin)?;
+    let new_bin = format!("{}/target/release/sit", src_dir);
+    let target = format!("{}/sit", local_bin);
+
+    std::fs::rename(&new_bin, &target)?;
+    println!("✅ sit updated to {}!", target);
+
+    // Clean old build artifacts
+    let build_dir = format!("{}/target", src_dir);
+    if std::path::Path::new(&build_dir).exists() {
+        std::fs::remove_dir_all(&build_dir)?;
+    }
+
+    println!("💡 Run 'sit --update' again to pull future updates.");
+    Ok(())
 }
 
 // ─── HTTP Client Builder ──────────────────────────────────────────────────────

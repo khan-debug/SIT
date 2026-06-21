@@ -128,7 +128,8 @@ elif [[ -f "$(pwd)/src/main.rs" ]]; then
     SIT_SRC="$(pwd)"
     info "  Using source from current directory."
 else
-    die "No sit source found. Run this script from inside the sit project directory."
+    info "  Cloning sit repository..."
+    git clone --depth=1 https://github.com/khan-debug/SIT.git "$SIT_SRC"
 fi
 
 cd "$SIT_SRC"
