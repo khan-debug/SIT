@@ -80,8 +80,6 @@ sit https://github.com/obsidianmd/obsidian-releases
 - [x] Web search fallback
 - [x] Distro-aware package selection
 - [x] Axel multi-connection downloads
-- [ ] Flatpak & Snap integration
-- [ ] GPG verification for signed packages
 
 ## ⚖️ License
 

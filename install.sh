@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-#  sit — installer
-#  Supports: Fedora / RHEL / Rocky  and  Ubuntu / Debian / Mint / Pop!_OS
+#  sit — Software Installer Tool
+#  One-shot installer: checks deps, builds from source, sets up PATH,
+#  and installs axel (the multi-connection download accelerator).
+#  Supports: Fedora / RHEL / Rocky  ·  Ubuntu / Debian / Mint / Pop!_OS
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -52,7 +54,6 @@ info "Detected distro family: ${BOLD}${DISTRO}${RESET}"
 if ! command -v sudo &>/dev/null; then
     die "sudo is required but not installed."
 fi
-# Pre-cache sudo credentials once so later calls don't prompt mid-install
 info "Some steps need sudo — you may be prompted for your password."
 sudo -v
 
@@ -61,36 +62,32 @@ sudo -v
 SUDO_KEEPER_PID=$!
 trap 'kill "$SUDO_KEEPER_PID" 2>/dev/null; exit' EXIT INT TERM
 
-# ── Helper: install system packages ──────────────────────────────────────────
-pkg_install() {
-    # Usage: pkg_install <pkg-on-fedora> <pkg-on-ubuntu>
-    local fedora_pkg="$1" ubuntu_pkg="$2"
-    if [[ "$DISTRO" == "fedora" ]]; then
-        sudo dnf install -y "$fedora_pkg" &>/dev/null
-    else
-        sudo apt-get install -y "$ubuntu_pkg" &>/dev/null
-    fi
-}
+# ── Helpers ──────────────────────────────────────────────────────────────────
+pkg_installed() { command -v "$1" &>/dev/null; }
 
-pkg_installed() {
-    command -v "$1" &>/dev/null
-}
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 1 — System build dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+info "Step 1/4 — Installing system build dependencies..."
 
-# ── Step 1: System build dependencies ────────────────────────────────────────
-info "Step 1/5 — Installing system build dependencies..."
+BUILD_DEPS="curl wget pkg-config ca-certificates git"
+FEDORA_DEPS="gcc openssl-devel"
+UBUNTU_DEPS="build-essential libssl-dev"
 
 if [[ "$DISTRO" == "fedora" ]]; then
     sudo dnf groupinstall -y "Development Tools" &>/dev/null || true
-    sudo dnf install -y gcc curl wget openssl-devel pkg-config axel flatpak &>/dev/null
+    sudo dnf install -y $BUILD_DEPS $FEDORA_DEPS &>/dev/null
 else
     sudo apt-get update -qq
-    sudo apt-get install -y build-essential curl wget libssl-dev pkg-config axel flatpak &>/dev/null
+    sudo apt-get install -y $BUILD_DEPS $UBUNTU_DEPS &>/dev/null
 fi
 
-success "System packages installed."
+success "System build dependencies installed."
 
-# ── Step 2: Rust toolchain ────────────────────────────────────────────────────
-info "Step 2/5 — Checking Rust toolchain..."
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 2 — Rust toolchain
+# ─────────────────────────────────────────────────────────────────────────────
+info "Step 2/4 — Checking Rust toolchain..."
 
 if pkg_installed cargo; then
     RUST_VER=$(cargo --version 2>/dev/null | awk '{print $2}')
@@ -99,14 +96,12 @@ else
     info "  Installing Rust via rustup..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain stable --profile minimal
-    # Load cargo into this session immediately
     # shellcheck disable=SC1091
     source "${HOME}/.cargo/env"
     success "Rust installed ($(cargo --version))."
 fi
 
 # Make sure cargo env is active for the rest of the script
-# (handles the case where rustup was already installed but env not loaded)
 if [[ -f "${HOME}/.cargo/env" ]]; then
     # shellcheck disable=SC1091
     source "${HOME}/.cargo/env"
@@ -116,64 +111,74 @@ if ! pkg_installed cargo; then
     die "cargo still not found after Rust install — something went wrong."
 fi
 
-# ── Step 3: Clone / update sit source ────────────────────────────────────────
-info "Step 3/5 — Fetching sit source..."
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 3 — Clone / compile sit
+# ─────────────────────────────────────────────────────────────────────────────
+info "Step 3/4 — Building sit from source..."
 
 SIT_SRC="${HOME}/.local/share/sit-src"
 
 if [[ -d "$SIT_SRC/.git" ]]; then
     info "  Existing clone found — pulling latest..."
     git -C "$SIT_SRC" pull --ff-only
+elif [[ -f "$(pwd)/Cargo.toml" ]] && grep -q 'name.*=.*"sit"' "$(pwd)/Cargo.toml" 2>/dev/null; then
+    info "  Using sit source from current directory: $(pwd)"
+    SIT_SRC="$(pwd)"
+elif [[ -f "$(pwd)/src/main.rs" ]]; then
+    SIT_SRC="$(pwd)"
+    info "  Using source from current directory."
 else
-    # If the user already has sit source in the current directory, use that
-    if [[ -f "$(pwd)/Cargo.toml" ]] && grep -q 'name.*=.*"sit"' "$(pwd)/Cargo.toml" 2>/dev/null; then
-        info "  Using sit source from current directory: $(pwd)"
-        SIT_SRC="$(pwd)"
-    else
-        # Try to clone from GitHub — update this URL once you push the repo
-        REPO_URL="${SIT_REPO_URL:-}"
-        if [[ -z "$REPO_URL" ]]; then
-            # No git repo yet — use source files from current directory
-            if [[ -f "$(pwd)/src/main.rs" ]]; then
-                SIT_SRC="$(pwd)"
-                info "  Using source from current directory."
-            else
-                die "No sit source found. Run this script from inside the sit project directory,\n   or set SIT_REPO_URL=https://github.com/you/sit before running."
-            fi
-        else
-            git clone "$REPO_URL" "$SIT_SRC"
-            info "  Cloned from ${REPO_URL}."
-        fi
-    fi
+    die "No sit source found. Run this script from inside the sit project directory."
 fi
 
-success "Source ready at ${SIT_SRC}."
-
-# ── Step 4: Compile ───────────────────────────────────────────────────────────
-info "Step 4/5 — Compiling sit (this takes 1-3 min on first run)..."
-
 cd "$SIT_SRC"
+info "  Compiling (this takes 1-3 min on first run)..."
 cargo build --release 2>&1 | grep -E '^(error|warning\[|Compiling sit|Finished)' || true
 
 BINARY="${SIT_SRC}/target/release/sit"
 if [[ ! -f "$BINARY" ]]; then
-    die "Build failed — binary not found at ${BINARY}.\n   Run 'cargo build --release' manually in ${SIT_SRC} and check errors."
+    die "Build failed — binary not found at ${BINARY}."
 fi
 
-success "Build complete."
-
-# ── Step 5: Install binary + shell setup ─────────────────────────────────────
-info "Step 5/5 — Installing sit to ~/.local/bin ..."
-
+# Install to ~/.local/bin
 LOCAL_BIN="${HOME}/.local/bin"
 mkdir -p "$LOCAL_BIN"
 cp "$BINARY" "${LOCAL_BIN}/sit"
 chmod +x "${LOCAL_BIN}/sit"
+export PATH="${LOCAL_BIN}:${PATH}"
 
-success "Binary installed to ${LOCAL_BIN}/sit."
+success "sit built and installed to ${LOCAL_BIN}/sit."
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 4 — Install axel (download accelerator used by sit)
+# ─────────────────────────────────────────────────────────────────────────────
+info "Step 4/4 — Installing axel download accelerator..."
+
+if pkg_installed axel; then
+    AXEL_VER=$(axel --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' || echo "available")
+    success "axel already installed (${AXEL_VER})."
+else
+    info "  axel lets sit download packages 2-4× faster using multiple connections."
+    if [[ "$DISTRO" == "fedora" ]]; then
+        sudo dnf install -y axel &>/dev/null
+    else
+        sudo apt-get install -y axel &>/dev/null
+    fi
+
+    if pkg_installed axel; then
+        success "axel installed."
+    else
+        warn "axel could not be installed — sit will fall back to curl for downloads."
+    fi
+fi
+
+# ── Flatpak remote (optional) ───────────────────────────────────────────────
+if pkg_installed flatpak; then
+    flatpak remote-add --if-not-exists --user flathub \
+        https://dl.flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
+fi
 
 # ── PATH setup ────────────────────────────────────────────────────────────────
-# Add ~/.local/bin to PATH in every shell rc the user has
 PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
 SHELLS_PATCHED=()
 
@@ -188,7 +193,6 @@ for RC in "${HOME}/.bashrc" "${HOME}/.zshrc" "${HOME}/.profile"; do
     fi
 done
 
-# Also patch .bash_profile if it exists and sources .bashrc (common on Fedora)
 if [[ -f "${HOME}/.bash_profile" ]] && ! grep -q '.local/bin' "${HOME}/.bash_profile" 2>/dev/null; then
     echo "" >> "${HOME}/.bash_profile"
     echo "# sit — added by installer" >> "${HOME}/.bash_profile"
@@ -196,38 +200,26 @@ if [[ -f "${HOME}/.bash_profile" ]] && ! grep -q '.local/bin' "${HOME}/.bash_pro
     SHELLS_PATCHED+=("${HOME}/.bash_profile")
 fi
 
-# Apply to the current session immediately
-export PATH="${LOCAL_BIN}:${PATH}"
-
 if [[ ${#SHELLS_PATCHED[@]} -gt 0 ]]; then
     success "Added ~/.local/bin to PATH in: ${SHELLS_PATCHED[*]}"
-else
-    info "~/.local/bin already in PATH — no changes needed."
-fi
-
-# ── Flatpak remote setup ───────────────────────────────────────────────────────
-info "Ensuring Flathub remote is configured for flatpak..."
-if pkg_installed flatpak; then
-    flatpak remote-add --if-not-exists --user flathub \
-        https://dl.flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
-    success "Flathub remote ready."
-else
-    warn "flatpak not found — Flathub search will be unavailable."
 fi
 
 # ── Verify ────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}────────────────────────────────────────────${RESET}"
-if command -v sit &>/dev/null || [[ -x "${LOCAL_BIN}/sit" ]]; then
-    SIT_PATH=$(command -v sit 2>/dev/null || echo "${LOCAL_BIN}/sit")
-    success "sit is ready!  (${SIT_PATH})"
+
+SIT_PATH=$(command -v sit 2>/dev/null || echo "${LOCAL_BIN}/sit")
+success "sit is ready!  (${SIT_PATH})"
+
+if pkg_installed axel; then
+    success "axel download accelerator ready."
 else
-    warn "sit installed but not yet in PATH for this session."
+    warn "axel not available — download speed may be slower. Install it with your package manager."
 fi
 
 echo ""
 echo -e "${BOLD}  Usage:${RESET}"
-echo -e "    ${CYAN}sit zed${RESET}                      — search & install Zed editor"
+echo -e "    ${CYAN}sit brave${RESET}                    — search & install Brave browser"
 echo -e "    ${CYAN}sit \"visual studio code\"${RESET}      — multi-word search"
 echo -e "    ${CYAN}sit https://zen-browser.app${RESET}  — install directly from URL"
 echo ""
