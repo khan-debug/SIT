@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 #  sit — Software Installer Tool
-#  One-shot installer: checks deps, builds from source, sets up PATH,
-#  and installs axel (the multi-connection download accelerator).
+#  One-shot installer: downloads pre-built binary (or builds from source),
+#  sets up PATH, and installs axel (the multi-connection download accelerator).
 #  Supports: Fedora / RHEL / Rocky  ·  Ubuntu / Debian / Mint / Pop!_OS
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -65,95 +65,100 @@ trap 'kill "$SUDO_KEEPER_PID" 2>/dev/null; exit' EXIT INT TERM
 # ── Helpers ──────────────────────────────────────────────────────────────────
 pkg_installed() { command -v "$1" &>/dev/null; }
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  STEP 1 — System build dependencies
-# ─────────────────────────────────────────────────────────────────────────────
-info "Step 1/4 — Installing system build dependencies..."
-
-BUILD_DEPS="curl wget pkg-config ca-certificates git"
-FEDORA_DEPS="gcc openssl-devel"
-UBUNTU_DEPS="build-essential libssl-dev"
-
-if [[ "$DISTRO" == "fedora" ]]; then
-    sudo dnf groupinstall -y "Development Tools" &>/dev/null || true
-    sudo dnf install -y $BUILD_DEPS $FEDORA_DEPS &>/dev/null
-else
-    sudo apt-get update -qq
-    sudo apt-get install -y $BUILD_DEPS $UBUNTU_DEPS &>/dev/null
-fi
-
-success "System build dependencies installed."
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  STEP 2 — Rust toolchain
-# ─────────────────────────────────────────────────────────────────────────────
-info "Step 2/4 — Checking Rust toolchain..."
-
-if pkg_installed cargo; then
-    RUST_VER=$(cargo --version 2>/dev/null | awk '{print $2}')
-    success "Rust already installed (cargo ${RUST_VER})."
-else
-    info "  Installing Rust via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain stable --profile minimal
-    # shellcheck disable=SC1091
-    source "${HOME}/.cargo/env"
-    success "Rust installed ($(cargo --version))."
-fi
-
-# Make sure cargo env is active for the rest of the script
-if [[ -f "${HOME}/.cargo/env" ]]; then
-    # shellcheck disable=SC1091
-    source "${HOME}/.cargo/env"
-fi
-
-if ! pkg_installed cargo; then
-    die "cargo still not found after Rust install — something went wrong."
-fi
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  STEP 3 — Clone / compile sit
-# ─────────────────────────────────────────────────────────────────────────────
-info "Step 3/4 — Building sit from source..."
-
-SIT_SRC="${HOME}/.local/share/sit-src"
-
-if [[ -d "$SIT_SRC/.git" ]]; then
-    info "  Existing clone found — pulling latest..."
-    git -C "$SIT_SRC" pull --ff-only
-elif [[ -f "$(pwd)/Cargo.toml" ]] && grep -q 'name.*=.*"sit"' "$(pwd)/Cargo.toml" 2>/dev/null; then
-    info "  Using sit source from current directory: $(pwd)"
-    SIT_SRC="$(pwd)"
-elif [[ -f "$(pwd)/src/main.rs" ]]; then
-    SIT_SRC="$(pwd)"
-    info "  Using source from current directory."
-else
-    info "  Cloning sit repository..."
-    git clone --depth=1 https://github.com/khan-debug/SIT.git "$SIT_SRC"
-fi
-
-cd "$SIT_SRC"
-info "  Compiling (this takes 1-3 min on first run)..."
-cargo build --release 2>&1 | grep -E '^(error|warning\[|Compiling sit|Finished)' || true
-
-BINARY="${SIT_SRC}/target/release/sit"
-if [[ ! -f "$BINARY" ]]; then
-    die "Build failed — binary not found at ${BINARY}."
-fi
-
-# Install to ~/.local/bin
 LOCAL_BIN="${HOME}/.local/bin"
 mkdir -p "$LOCAL_BIN"
-cp "$BINARY" "${LOCAL_BIN}/sit"
-chmod +x "${LOCAL_BIN}/sit"
-export PATH="${LOCAL_BIN}:${PATH}"
-
-success "sit built and installed to ${LOCAL_BIN}/sit."
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  STEP 4 — Install axel (download accelerator used by sit)
+#  STEP 1 — Try pre-built binary from GitHub Releases
 # ─────────────────────────────────────────────────────────────────────────────
-info "Step 4/4 — Installing axel download accelerator..."
+info "Step 1/3 — Downloading pre-built binary..."
+
+BINARY="${LOCAL_BIN}/sit"
+DOWNLOAD_OK=false
+
+if curl -fsSL -o "$BINARY" "https://github.com/khan-debug/SIT/releases/latest/download/sit" 2>/dev/null; then
+    chmod +x "$BINARY"
+    if "$BINARY" --version &>/dev/null; then
+        DOWNLOAD_OK=true
+    fi
+fi
+
+if $DOWNLOAD_OK; then
+    export PATH="${LOCAL_BIN}:${PATH}"
+    success "sit installed to ${LOCAL_BIN}/sit ($("$BINARY" --version))."
+else
+    warn "No pre-built binary found — building from source."
+
+    # ── Build dependencies ───────────────────────────────────────────────────
+    info "  Installing build dependencies..."
+
+    BUILD_DEPS="curl wget pkg-config ca-certificates git"
+    FEDORA_DEPS="gcc openssl-devel"
+    UBUNTU_DEPS="build-essential libssl-dev"
+
+    if [[ "$DISTRO" == "fedora" ]]; then
+        sudo dnf groupinstall -y "Development Tools" &>/dev/null || true
+        sudo dnf install -y $BUILD_DEPS $FEDORA_DEPS &>/dev/null
+    else
+        sudo apt-get update -qq
+        sudo apt-get install -y $BUILD_DEPS $UBUNTU_DEPS &>/dev/null
+    fi
+
+    # ── Rust toolchain ──────────────────────────────────────────────────────
+    if pkg_installed cargo; then
+        RUST_VER=$(cargo --version 2>/dev/null | awk '{print $2}')
+        success "  Rust already installed (cargo ${RUST_VER})."
+    else
+        info "  Installing Rust via rustup..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+        source "${HOME}/.cargo/env"
+    fi
+
+    if [[ -f "${HOME}/.cargo/env" ]]; then
+        source "${HOME}/.cargo/env"
+    fi
+
+    if ! pkg_installed cargo; then
+        die "cargo still not found after Rust install — something went wrong."
+    fi
+
+    # ── Clone & compile ─────────────────────────────────────────────────────
+    SIT_SRC="${HOME}/.local/share/sit-src"
+
+    if [[ -d "$SIT_SRC/.git" ]]; then
+        info "  Existing clone found — pulling latest..."
+        git -C "$SIT_SRC" pull --ff-only
+    elif [[ -f "$(pwd)/Cargo.toml" ]] && grep -q 'name.*=.*"sit"' "$(pwd)/Cargo.toml" 2>/dev/null; then
+        info "  Using sit source from current directory: $(pwd)"
+        SIT_SRC="$(pwd)"
+    elif [[ -f "$(pwd)/src/main.rs" ]]; then
+        SIT_SRC="$(pwd)"
+        info "  Using source from current directory."
+    else
+        info "  Cloning sit repository..."
+        git clone --depth=1 https://github.com/khan-debug/SIT.git "$SIT_SRC"
+    fi
+
+    cd "$SIT_SRC"
+    info "  Compiling (this takes 1-3 min on first run)..."
+    cargo build --release 2>&1 | grep -E '^(error|warning\[|Compiling sit|Finished)' || true
+
+    if [[ ! -f "${SIT_SRC}/target/release/sit" ]]; then
+        die "Build failed — binary not found."
+    fi
+
+    cp "${SIT_SRC}/target/release/sit" "$BINARY"
+    chmod +x "$BINARY"
+    export PATH="${LOCAL_BIN}:${PATH}"
+
+    success "sit built from source and installed to ${LOCAL_BIN}/sit."
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 2 — Install axel (download accelerator used by sit)
+# ─────────────────────────────────────────────────────────────────────────────
+info "Step 2/3 — Installing axel download accelerator..."
 
 if pkg_installed axel; then
     AXEL_VER=$(axel --version 2>/dev/null | head -1 | grep -oP '\d+\.\d+\.\d+' || echo "available")
@@ -173,13 +178,11 @@ else
     fi
 fi
 
-# ── Flatpak remote (optional) ───────────────────────────────────────────────
-if pkg_installed flatpak; then
-    flatpak remote-add --if-not-exists --user flathub \
-        https://dl.flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
-fi
+# ─────────────────────────────────────────────────────────────────────────────
+#  STEP 3 — PATH setup
+# ─────────────────────────────────────────────────────────────────────────────
+info "Step 3/3 — Setting up PATH..."
 
-# ── PATH setup ────────────────────────────────────────────────────────────────
 PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
 SHELLS_PATCHED=()
 
@@ -203,6 +206,12 @@ fi
 
 if [[ ${#SHELLS_PATCHED[@]} -gt 0 ]]; then
     success "Added ~/.local/bin to PATH in: ${SHELLS_PATCHED[*]}"
+fi
+
+# ── Flatpak remote (optional) ───────────────────────────────────────────────
+if pkg_installed flatpak; then
+    flatpak remote-add --if-not-exists --user flathub \
+        https://dl.flathub.org/repo/flathub.flatpakrepo 2>/dev/null || true
 fi
 
 # ── Verify ────────────────────────────────────────────────────────────────────
