@@ -1347,60 +1347,39 @@ fn auto_select_best_package(links: &[(String, String)], distro: &Distro) -> usiz
 
 // ─── Self-Update ─────────────────────────────────────────────────────────────
 
-/// Pull latest source, rebuild, and replace the running binary.
+/// Download the latest pre-built binary from GitHub Releases.
 async fn self_update() -> Result<(), Box<dyn std::error::Error>> {
     let home = env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-    let src_dir = format!("{}/.local/share/sit-src", home);
     let local_bin = format!("{}/.local/bin", home);
+    let target = format!("{}/sit", local_bin);
 
-    // Clone if missing, otherwise pull
-    if std::path::Path::new(&src_dir).exists() {
-        println!("📥 Pulling latest source...");
-        let status = std::process::Command::new("git")
-            .args(["-C", &src_dir, "pull", "--ff-only"])
-            .status()?;
-        if !status.success() {
-            println!("❌ git pull failed — you may have local changes.");
-            return Ok(());
-        }
-    } else {
-        println!("📥 Cloning sit repository...");
-        std::fs::create_dir_all(&src_dir)?;
-        let status = std::process::Command::new("git")
-            .args(["clone", "--depth=1", "https://github.com/khan-debug/SIT.git", &src_dir])
-            .status()?;
-        if !status.success() {
-            println!("❌ Clone failed. Check your internet connection.");
-            return Ok(());
-        }
-    }
-
-    // Build
-    println!("🔨 Rebuilding sit...");
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(&src_dir)
+    println!("📥 Downloading latest sit binary...");
+    let status = std::process::Command::new("curl")
+        .args(["-fsSL", "-o", &target,
+            "https://github.com/khan-debug/SIT/releases/latest/download/sit"])
         .status()?;
+
     if !status.success() {
-        println!("❌ Build failed.");
+        println!("❌ Failed to download update. Check your connection.");
         return Ok(());
     }
 
-    // Install
+    // chmod +x and verify
+    std::process::Command::new("chmod").args(["+x", &target]).status()?;
+
+    let ver = std::process::Command::new(&target).arg("--version").output();
     std::fs::create_dir_all(&local_bin)?;
-    let new_bin = format!("{}/target/release/sit", src_dir);
-    let target = format!("{}/sit", local_bin);
 
-    std::fs::rename(&new_bin, &target)?;
-    println!("✅ sit updated to {}!", target);
-
-    // Clean old build artifacts
-    let build_dir = format!("{}/target", src_dir);
-    if std::path::Path::new(&build_dir).exists() {
-        std::fs::remove_dir_all(&build_dir)?;
+    match ver {
+        Ok(out) => {
+            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            println!("✅ sit updated to {}!", v);
+        }
+        _ => {
+            println!("⚠  Binary downloaded but verification failed.");
+        }
     }
 
-    println!("💡 Run 'sit --update' again to pull future updates.");
     Ok(())
 }
 
