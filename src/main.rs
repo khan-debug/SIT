@@ -382,12 +382,10 @@ fn parse_search_html(html: &str, query: &str) -> Vec<AppMatch> {
             || href.contains("search.brave.com")
             || href.contains("search.brave.")
             || href.contains("github.com")
-            || href.contains("flathub.org")
             || href.contains("youtube.com")
             || href.contains("reddit.com")
             || href.contains("stackoverflow.com")
             || href.contains("wikipedia.org")
-            || href.contains("snapcraft.io")
         {
             continue;
         }
@@ -412,13 +410,8 @@ fn parse_search_html(html: &str, query: &str) -> Vec<AppMatch> {
             continue;
         }
 
-        let dedup_key = if href.contains("github.com") {
-            href.clone()
-        } else {
-            domain.clone()
-        };
-        if seen_urls.contains(&dedup_key) { continue; }
-        seen_urls.push(dedup_key);
+        if seen_urls.contains(&href) { continue; }
+        seen_urls.push(href.clone());
 
         // ── Score relevance ─────────────────────────────────────────────────
         let mut score: i32 = 0;
