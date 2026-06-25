@@ -8,6 +8,7 @@ name = "sit"
 path = "src/main.rs"
 
 [dependencies]
+sha2 = "0.10"
 # Async runtime
 tokio        = { version = "1",  features = ["full"] }
 
@@ -31,6 +32,13 @@ regex        = "1"
 
 # Interactive TUI selector
 dialoguer    = { version = "0.11", features = ["completion"] }
+
+# Base64 decode (Bing search URL decoding)
+base64       = "0.22"
+
+# Progress bar
+indicatif    = "0.17"
+
 
 [profile.release]
 opt-level = 3
